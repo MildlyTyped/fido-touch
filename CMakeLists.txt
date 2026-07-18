@@ -96,6 +96,17 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
+# Touchscreen UI for the Waveshare RP2040-Touch-LCD-1.69 (ST7789V2 + CST816T).
+option(ENABLE_DISPLAY_UI "Enable/disable the on-screen touch UI" OFF)
+if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
+    add_compile_definitions(ENABLE_DISPLAY_UI=1)
+    message(STATUS "Touch display UI: \t\t enabled")
+    # Auto-register the bundled board header when our board name is selected.
+    if(PICO_BOARD STREQUAL "waveshare_rp2040_touch_lcd_1_69")
+        list(APPEND PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/src/boards)
+    endif()
+endif()
+
 if(ENABLE_OTP_APP OR ENABLE_OATH_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
@@ -148,6 +159,16 @@ if(ENABLE_OTP_APP)
     )
 endif()
 
+if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/display/st7789.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/display/cst816.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/display/gfx.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/display/battery.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/display/display_ui.c
+    )
+endif()
+
 SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
 if(ESP_PLATFORM)
     project(pico_fido)
@@ -156,6 +177,12 @@ endif()
 set(INCLUDES ${INCLUDES}
     ${CMAKE_CURRENT_LIST_DIR}/src/fido
 )
+
+if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
+    set(INCLUDES ${INCLUDES}
+        ${CMAKE_CURRENT_LIST_DIR}/src/display
+    )
+endif()
 
 if(NOT ESP_PLATFORM)
     target_sources(pico_fido PUBLIC ${SOURCES})
@@ -269,6 +296,8 @@ if(NOT ESP_PLATFORM)
                 hardware_flash
                 hardware_sync
                 hardware_adc
+                hardware_spi
+                hardware_i2c
                 pico_unique_id
                 pico_aon_timer
                 tinyusb_device
