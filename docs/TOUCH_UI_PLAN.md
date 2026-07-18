@@ -100,8 +100,8 @@ blenders are used instead). Screens are plain LVGL objects switched with
 
 - **B — Status (default/idle).** "PICO FIDO", connection state (Ready /
   Connected, driven by `SIGNAL_USB_MOUNTED`) and battery %. Tap → Menu.
-- **A — Confirm.** Shown on `SIGNAL_USER_PRESENCE_REQUEST`. Optional relying
-  party / user context (via `display_ui_set_context()`), a live countdown, and
+- **A — Confirm.** Shown on `SIGNAL_USER_PRESENCE_REQUEST`. Shows the relying
+  party (and user name for make-credential), a live countdown, and
   full-width **APPROVE** (green) / **DENY** (red) buttons. Approve →
   `touch_accept_button`; Deny → `cancel_button`. Auto-returns to Status on
   complet/cancel/timeout.
@@ -132,9 +132,12 @@ links LVGL. Copy `pico_fido.uf2` to the board in BOOTSEL mode.
 
 1. **Verify pins & touch mapping** against the schematic; add touch rotation /
    calibration if X/Y are swapped or inverted.
-2. **Relying-party context** — call `display_ui_set_context()` from the CTAP
-   make-credential / get-assertion paths so screen A can show the site/user.
-   Requires passing the RP id down to where presence is requested.
+2. **Relying-party context** — *done.* `cbor_make_credential` /
+   `cbor_get_assertion` call `display_ui_set_context()` (a weak no-op in
+   `fido.c`, overridden by the display build) before requesting presence, so
+   screen A shows the RP id (+ user name for make-credential). The FIDO handlers
+   run on core 1, so only the strings are copied there; the LVGL labels are
+   updated from the core-0 presence-request handler.
 3. **Credentials & OATH screens (C)** — enumerate resident credentials and
    render live TOTP codes. Needs read-only accessors into the FIDO/OATH stores.
 4. **PWM backlight** dimming (vendor demo uses PWM on GP25) and screen

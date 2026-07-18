@@ -216,6 +216,10 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
     user_name = NULL;
     display_name = NULL;
 
+    /* Show the relying party on the touch Approve prompt, if built in. The
+     * user is only known after a credential is selected, so pass NULL. */
+    display_ui_set_context(rpId.present ? rpId.data : NULL, NULL);
+
     uint8_t flags = 0;
     uint8_t rp_id_hash[32] = {0};
     mbedtls_sha256((uint8_t *) rpId.data, rpId.len, rp_id_hash, 0);

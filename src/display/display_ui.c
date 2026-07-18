@@ -345,16 +345,24 @@ static int on_usb_mounted(signal_code_t code, void *data) {
 }
 
 /* ----- Public API + SDK hooks ------------------------------------------- */
+/* Called from the FIDO command handlers, which run on core 1. Only copy the
+ * strings here - the labels are pushed to LVGL from on_presence_request(),
+ * which runs on core 0 after the presence request crosses the core queue, so
+ * LVGL is never touched from core 1. Both fields are always set (cleared when
+ * NULL) so the prompt reflects only the current operation. */
 void display_ui_set_context(const char *rp_id, const char *user_name) {
     if (rp_id) {
         strncpy(g_ctx_rp, rp_id, sizeof(g_ctx_rp) - 1);
         g_ctx_rp[sizeof(g_ctx_rp) - 1] = '\0';
+    } else {
+        g_ctx_rp[0] = '\0';
     }
     if (user_name) {
         strncpy(g_ctx_user, user_name, sizeof(g_ctx_user) - 1);
         g_ctx_user[sizeof(g_ctx_user) - 1] = '\0';
+    } else {
+        g_ctx_user[0] = '\0';
     }
-    apply_context();
 }
 
 void platform_ui_init(void) {

@@ -122,6 +122,11 @@ extern const known_app_t *find_app_by_rp_id_hash(const uint8_t *rp_id_hash);
 #define TRANSPORT_TIME_LIMIT (30 * 1000) //USB
 
 bool check_user_presence(void);
+/* Optional touch-UI hook: give the on-screen Approve prompt the relying-party
+ * id / user name before user presence is requested. Weak no-op unless the
+ * display UI (src/display/display_ui.c) is built in. Either argument may be
+ * NULL. Copies the strings; the caller keeps ownership. */
+void display_ui_set_context(const char *rp_id, const char *user_name);
 void fido_led_3_blinks(void);
 int fido_process_apdu(void);
 int cmd_register(void);
