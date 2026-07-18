@@ -1,11 +1,17 @@
 # Pico FIDO
 This project transforms your Raspberry Pi Pico or ESP32 microcontroller into an integrated FIDO Passkey, functioning like a standard USB Passkey for authentication.
 
-> **Touchscreen fork (fido-touch).** This fork adds an optional touchscreen UI for
-> the [Waveshare RP2040-Touch-LCD-1.69](https://www.waveshare.com/wiki/RP2040-Touch-LCD-1.69):
-> on-screen Approve/Deny for FIDO user presence, a status/battery screen, and a
-> management-UI skeleton. It is off by default (`-DENABLE_DISPLAY_UI=1` to enable).
-> See [`docs/TOUCH_UI_PLAN.md`](docs/TOUCH_UI_PLAN.md) for the design and build steps.
+> **Touchscreen fork (fido-touch).** This fork adds an optional touchscreen UI:
+> on-screen Approve/Deny for FIDO user presence, a status screen, and read-only
+> credential/OATH management lists.
+> **Target hardware is moving to an ESP32-S3 DevKit + the
+> [Waveshare 2" Capacitive Touch LCD](https://www.waveshare.com/wiki/2inch_Capacitive_Touch_LCD)**
+> (ST7789T3 over SPI, CST816D touch over I2C) — which, unlike the RP2040, supports
+> Flash Encryption + Secure Boot for real hardware-backed key storage. The
+> original RP2040 (Waveshare RP2040-Touch-LCD-1.69) LVGL scaffold still builds
+> (`-DENABLE_DISPLAY_UI=1`) and is kept as a reference. See
+> [`docs/TOUCH_UI_PLAN.md`](docs/TOUCH_UI_PLAN.md) for the ESP32-S3 design,
+> wiring, and next steps.
 
 If you are looking for a OpenPGP + Fido, see: https://github.com/polhenarejos/pico-fido2. Available through [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App").
 

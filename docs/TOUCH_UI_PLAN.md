@@ -1,178 +1,201 @@
-# Pico FIDO Touch — Waveshare RP2040-Touch-LCD-1.69 support
+# Pico FIDO Touch — ESP32-S3 + Waveshare 2" Capacitive Touch LCD
 
-This document describes how **pico-fido** is extended to run on the
-[Waveshare RP2040-Touch-LCD-1.69](https://www.waveshare.com/wiki/RP2040-Touch-LCD-1.69),
-a plain RP2040 board with a 1.69" 240×280 IPS LCD, capacitive touch, an IMU
-and a Li-ion charger. The goal is to use the touchscreen for three things:
+> **Hardware pivot (2026-07).** The target moved from the RP2040-based
+> *Waveshare RP2040-Touch-LCD-1.69* to an **ESP32-S3 DevKit** driving the
+> external [Waveshare 2" Capacitive Touch LCD](https://www.waveshare.com/wiki/2inch_Capacitive_Touch_LCD).
+> This document is the ESP32-S3 plan. The earlier RP2040 scaffold (LVGL UI +
+> drivers under `src/display/`) still builds and is kept as a reference; see
+> [Legacy RP2040 scaffold](#legacy-rp2040-scaffold) for what carries over.
 
-- **A. Approve/Deny prompt** for FIDO user-presence confirmation — replacing the
-  BOOTSEL button tap with an on-screen button that shows what is being approved.
-- **B. Status display** — idle/connected state and battery level.
-- **C. Management UI** — a menu skeleton for browsing credentials and OATH codes.
+This describes how **pico-fido** is extended to use the touchscreen for three
+things, unchanged from the original goals:
 
-The code in this repository is a **scaffold**: it builds into a flashable
-`pico_fido.uf2`, brings up the panel, reads touch input and drives the three
-screens, but several items (listed under *Follow-ups*) still need real hardware
-bring-up and deeper FIDO integration.
+- **A. Approve/Deny prompt** for FIDO user-presence confirmation — an on-screen
+  button that shows the relying party (and user, for registration) being
+  approved, instead of a physical button.
+- **B. Status display** — idle/connected state (battery is dropped: the 2" LCD
+  module and a plain ESP32-S3 DevKit have no fuel gauge / charger).
+- **C. Management UI** — read-only lists of resident FIDO credentials and OATH
+  account names.
+
+## Why the pivot helps: real secure key storage
+
+The RP2040 has **no** secure key storage — external QSPI flash is unencrypted
+and dumpable (see the main README → *Security Considerations*), which is why the
+RP2040 build was explicitly a "prototype, accept the risk".
+
+The **ESP32-S3 removes that limitation.** With **Flash Encryption** + **Secure
+Boot v2** enabled, the master key encryption key (MKEK) lives in eFuse and is
+inaccessible to external code, so all resident keys/seeds are encrypted at rest
+and only signed firmware runs. pico-fido already advertises this
+("Secure Boot and Secure Lock in RP2350 and ESP32-S3", README line 48). So on
+this hardware the device can offer genuine hardware-backed protection — no
+longer just a prototype caveat.
+
+> ⚠️ Enabling Flash Encryption / Secure Boot **burns eFuses and is
+> irreversible**. Do it deliberately (release mode, key management, `espefuse`)
+> and only once the firmware is stable. It is a deployment/`sdkconfig` decision,
+> not a code change — see *Next steps*.
 
 ## Target hardware
 
-| Function        | Chip       | Bus            | Pins (GP)                                   |
-|-----------------|------------|----------------|---------------------------------------------|
-| Display         | ST7789V2   | SPI1 @ 40 MHz  | DC 8, CS 9, CLK 10, MOSI 11, RST 13, BL 25  |
-| Touch           | CST816T    | I2C1 @ 400 kHz | SDA 6, SCL 7, INT 21, RST 22 (addr 0x15)    |
-| IMU (optional)  | QMI8658    | I2C1 (shared)  | SDA 6, SCL 7 (addr 0x6B)                     |
-| Battery sense   | —          | ADC            | GP29 / ADC3 via divider (verify!)           |
+**Board:** ESP32-S3 DevKit (dual-core Xtensa LX7, native USB-OTG, PSRAM
+depending on module). **Display module:** Waveshare 2" Capacitive Touch LCD.
 
-Panel geometry: 240×280 visible out of the ST7789 240×320 GRAM, so rows are
-offset by 20 (`LCD_ROW_OFFSET`). Pin values come from the Waveshare vendor C
-demo (`lib/Config/DEV_Config.h`, `lib/LCD/*`) and are centralised in
-[`src/display/board_config.h`](../src/display/board_config.h). **They must be
-verified against the board schematic before trusting them on hardware.**
+| Function | Chip | Bus | Notes |
+|----------|------|-----|-------|
+| Display  | **ST7789T3** | 4-wire SPI | 240×320, IPS, 262K colours, command-compatible with the `esp_lcd` ST7789 driver |
+| Touch    | **CST816D**  | I2C | CST81x family; works with the `esp_lcd_touch_cst816s` driver |
+| microSD  | (on module)  | shared SPI | present but unused by this firmware |
 
-## How it plugs into pico-fido
+Full-frame 240×320 RGB565 = 150 KB; the ESP32-S3 has ample RAM (and usually
+PSRAM) so we are not forced into the tiny partial buffer the RP2040 needed.
 
-pico-fido already has almost everything needed; the firmware is built on the
-`pico-keys-sdk` submodule which exposes the right seams:
+### Reference wiring (Waveshare ESP32-S3 example)
 
-- **`picokey_init()`** — a `WEAK` hook the SDK calls once at boot. We override it
-  (in `display_ui.c`) to initialise the display, touch and battery and to
-  register signal handlers.
-- **`platform_ui_task()`** — the SDK's core-0 main loop (`execute_tasks()`) calls
-  this every iteration when `ENABLE_DISPLAY_UI` (or `ENABLE_LVGL_UI`) is defined.
-  We use it to poll touch and redraw.
-- **The signal bus** (`signal.h`) — `button_wait()` already emits
-  `SIGNAL_USER_PRESENCE_REQUEST / _COMPLETED / _CANCELLED / _TIMEOUT`, and
-  `usb_task()` emits `SIGNAL_USB_MOUNTED`. The UI subscribes to these to switch
-  screens; nothing in the FIDO core has to change.
+The module connects over a 15-pin FPC/header. The ESP32-S3 uses a GPIO matrix,
+so any free GPIOs work; the table below is Waveshare's own ESP32-S3 example and
+is the recommended default. **Verify against the specific DevKit before
+trusting it.**
 
-### The one required SDK change
+| LCD pin  | ESP32-S3 GPIO | LCD pin | ESP32-S3 GPIO |
+|----------|---------------|---------|---------------|
+| 3V3      | 3V3           | LCD_CS  | GPIO39        |
+| GND      | GND           | LCD_DC  | GPIO41        |
+| MISO     | GPIO42        | LCD_RST | GPIO40        |
+| MOSI     | GPIO2         | LCD_BL  | GPIO6         |
+| SCLK     | GPIO1         | TP_SDA  | GPIO15        |
+| SD_CS    | GPIO38        | TP_SCL  | GPIO7         |
+| TP_INT   | GPIO17        | TP_RST  | GPIO16        |
 
-User-presence confirmation funnels through `button_wait()` in
-`pico-keys-sdk/src/button.c` (running on core 0, where keep-alive, LED and
-timeout handling live). It confirms on a physical button read and cancels on the
-`cancel_button` flag, but there was **no way to inject an "approve" from
-software** — even though the SDK already declared a `touch_accept_button` flag
-for exactly this and left it unwired.
+These become Kconfig/`sdkconfig` values (or a small `board_config.h`), not a
+Pico SDK board header.
 
-The fork wires it in (2 lines): `button_wait()` now treats `touch_accept_button`
-as a press, and the `platform_ui_task()` hook is enabled by `ENABLE_DISPLAY_UI`
-too. This lives on the `touch-screen-support` branch of the
-`MildlyTyped/pico-keys-sdk` fork, which the submodule points at. Keeping the
-change in the SDK means keep-alive to the host, the timeout and the LED status
-all keep working unchanged while the user takes time to tap.
+## How it builds on ESP32-S3 (ESP-IDF)
 
-```
-    while (button_pressed == false && cancel_button == false) {
-        execute_tasks();                 // -> platform_ui_task() polls touch
-        ...
-        button_pressed = picok_board_button_read() || touch_accept_button;
-    }
-```
-
-The UI's approve handler sets `touch_accept_button = true`; the deny handler sets
-`cancel_button = true`. Because both the handler and `button_wait()` run on
-core 0, there is no cross-core race.
-
-## Module layout (`src/display/`)
-
-| File            | Responsibility                                                    |
-|-----------------|-------------------------------------------------------------------|
-| `board_config.h`| All pin / bus / geometry constants for the board.                 |
-| `st7789.c/.h`   | ST7789V2 SPI driver: init, fill-rect, blit, backlight.            |
-| `cst816.c/.h`   | CST816T I2C touch driver: init + `cst816_read()` (point + gesture)|
-| `battery.c/.h`  | ADC battery voltage → percent.                                    |
-| `display_ui.c/.h`| LVGL screens, signal handlers, `platform_ui_task/init`.          |
-| `lv_conf.h`     | Minimal LVGL config (RGB565, 32 KB pool, Montserrat fonts).       |
-| `../boards/waveshare_rp2040_touch_lcd_1_69.h` | Pico SDK board header (16 MB flash). |
-| `../../lib/lvgl` | LVGL v9.2.2 submodule (UI toolkit).                              |
-
-The UI is built with **LVGL** (v9.2.2, vendored as the `lib/lvgl` submodule).
-`display_ui.c` provides the two LVGL platform callbacks — a display *flush* that
-pushes rendered tiles through `st7789_blit()`, and a pointer *input* read that
-wraps `cst816_read()` — plus a runtime tick from `board_millis()`. Rendering is
-**partial** (a 240×40 RGB565 draw buffer, ~19 KB) to fit RP2040 SRAM, and the
-Helium/Neon assembly accelerators are excluded from the LVGL build (the C
-blenders are used instead). Screens are plain LVGL objects switched with
-`lv_screen_load()`; `lv_timer_handler()` is pumped from `platform_ui_task()`.
-
-## Screens
-
-- **B — Status (default/idle).** "PICO FIDO", connection state (Ready /
-  Connected, driven by `SIGNAL_USB_MOUNTED`) and battery %. Tap → Menu.
-- **A — Confirm.** Shown on `SIGNAL_USER_PRESENCE_REQUEST`. Shows the relying
-  party (and user name for make-credential), a live countdown, and
-  full-width **APPROVE** (green) / **DENY** (red) buttons. Approve →
-  `touch_accept_button`; Deny → `cancel_button`. Auto-returns to Status on
-  complet/cancel/timeout.
-- **C — Menu.** Credentials / OATH accounts / Device info / Back.
-  - **Credentials** — scrollable list of resident FIDO credentials (relying
-    party + user name), populated on entry from `fido_ui_list_credentials()`.
-  - **OATH accounts** — scrollable list of stored OATH account names
-    (`fido_ui_list_oath()`). Codes are **not** generated on-device: TOTP needs
-    the current time, which only the host provides (this board has no RTC), and
-    the secrets may be OATH-password-locked.
-  - Both lists read the RAM-cached stores on core 0 and are skipped while a
-    transaction is active (`is_busy()`), so they never race a live command.
-    Device-info remains a static screen.
-
-## Build & flash
+pico-fido **already supports ESP32** via ESP-IDF — the top-level
+`CMakeLists.txt` has an `ESP_PLATFORM` branch that registers `src/fido` and the
+`pico-keys-sdk/config/esp32/components/*` components and includes
+`$IDF_PATH/tools/cmake/project.cmake`. Build is:
 
 ```sh
-git clone --recurse-submodules https://github.com/MildlyTyped/fido-touch
-cd fido-touch
-mkdir build && cd build
-PICO_SDK_PATH=/path/to/pico-sdk cmake .. \
-    -DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69 \
-    -DENABLE_DISPLAY_UI=1
-make -j4
+idf.py set-target esp32s3
+idf.py menuconfig      # enable OATH/OTP, display UI, pins; later: flash enc / secure boot
+idf.py build flash monitor
 ```
 
-Selecting `-DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69` installs the bundled
-board header into the Pico SDK's board dir at configure time (the pico-keys SDK
-reads it directly from there), so no `-DPICO_BOARD_HEADER_DIRS` is needed.
-`-DPICO_BOARD=pico` also works (2 MB flash assumed). Enabling the UI defines
-both `ENABLE_DISPLAY_UI` and `ENABLE_LVGL_UI` (the SDK's reserved task hook) and
-links LVGL. Copy `pico_fido.uf2` to the board in BOOTSEL mode.
-`ENABLE_DISPLAY_UI` defaults to **OFF**, so non-display builds are unaffected.
+The same SDK seams the RP2040 UI uses are **already wired on ESP32**:
 
-## Follow-ups (scaffolded but not finished)
+- `picokey_init()` (WEAK) is called at boot on both platforms
+  (`pico-keys-sdk/src/main.c`).
+- `execute_tasks()` calls `platform_ui_task()` when `ENABLE_LVGL_UI` /
+  `ENABLE_DISPLAY_UI` is defined — and on ESP32 that runs inside the
+  `core0_loop` FreeRTOS task (`xTaskCreatePinnedToCore(core0_loop, ...)`).
+- The signal bus (`SIGNAL_USER_PRESENCE_REQUEST/_COMPLETED/_CANCELLED/_TIMEOUT`,
+  `SIGNAL_USB_MOUNTED`) is platform-independent.
+- The FIDO→UI hooks added for the RP2040 are platform-independent C and carry
+  over unchanged: `display_ui_set_context()` (Approve-screen context) and
+  `fido_ui_list_credentials()` / `fido_ui_list_oath()` (management lists).
 
-1. **Verify pins & touch mapping** against the schematic; add touch rotation /
-   calibration if X/Y are swapped or inverted.
-2. **Relying-party context** — *done.* `cbor_make_credential` /
-   `cbor_get_assertion` call `display_ui_set_context()` (a weak no-op in
-   `fido.c`, overridden by the display build) before requesting presence, so
-   screen A shows the RP id (+ user name for make-credential). The FIDO handlers
-   run on core 1, so only the strings are copied there; the LVGL labels are
-   updated from the core-0 presence-request handler.
-3. **Credentials & OATH screens (C)** — *done (read-only listing).*
-   `fido_ui_list_credentials()` (credential.c) enumerates resident credentials
-   and `fido_ui_list_oath()` (oath.c) lists OATH account names; the Menu
-   sub-screens render them as scrollable lists. On-device TOTP code generation
-   is intentionally out of scope — TOTP requires host-supplied time (no RTC)
-   and the OATH secrets can be password-locked.
-4. **PWM backlight** dimming (vendor demo uses PWM on GP25) and screen
-   blanking / low-power sleep when idle to save battery.
-5. **IMU (QMI8658)** — optional orientation / tap-to-wake.
-6. **Richer LVGL UI** — the toolkit is in place; add themes, animations, and
-   QR/large fonts as needed.
-7. **Security note** — the RP2040 has no secure key storage (see the main
-   README). A display does not change that; do not present it as a hardware
-   security module.
-8. **Strict warnings** — add `src/display/` to `picokeys_apply_strict_flags`
-   once the drivers are hardware-validated.
+**What currently blocks the ESP32 UI:** the display integration is gated
+`AND NOT ESP_PLATFORM` in `CMakeLists.txt` (the RP2040 path pulls in the Pico
+SDK, the `lib/lvgl` git submodule, and bit-banged drivers). The port replaces
+that path, not the UI logic.
 
-## Testing
+## Display / touch / LVGL architecture on ESP-IDF
 
-- **Host build check:** the display/LVGL sources are excluded from the
-  emulation target (`-DENABLE_EMULATION=1`) by CMake, and the driver hardware
-  code is additionally guarded behind `#ifndef ENABLE_EMULATION`, so this change
-  does not affect it. (The emulation binary separately needs the `tss2` TPM
-  headers, unrelated to the display work.)
-- **Board build check:** `-DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69
-  -DENABLE_DISPLAY_UI=1` produces a valid `pico_fido.uf2` with LVGL linked
-  (verified in this branch; ~126 KB SRAM/BSS used).
-- **On hardware (to do):** confirm panel init/colours, touch coordinates,
-  approve/deny flow end-to-end against a WebAuthn test page, and battery
-  reading.
+Use Espressif's managed components instead of the RP2040 submodule + hand-written
+drivers (declare them in an `idf_component.yml`):
+
+- **`esp_lcd`** (built into IDF): `esp_lcd_new_panel_io_spi()` +
+  `esp_lcd_new_panel_st7789()` drive the ST7789T3 over the SPI bus.
+- **`espressif/esp_lcd_touch_cst816s`**: CST816D touch over I2C.
+- **`lvgl/lvgl` (v9)** + **`espressif/esp_lvgl_port`**: `esp_lvgl_port` creates
+  the LVGL task, tick, and draw buffers, and binds an `esp_lcd` panel +
+  `esp_lcd_touch` device to an LVGL display/indev — replacing the manual
+  `disp_flush` / `touch_read` / `lv_tick_set_cb` callbacks and the `.S`-file
+  filtering we needed on Cortex-M0+.
+
+### Concurrency model (important difference from RP2040)
+
+On the RP2040 the UI was single-threaded on core 0 (`platform_ui_task()` and the
+signal handlers all ran there), so UI code touched LVGL with no lock. On ESP32-S3
+under FreeRTOS, `esp_lvgl_port` runs LVGL in its **own task**, so any code that
+mutates LVGL objects from another task (e.g. a signal handler dispatched on the
+FIDO task) **must hold the port lock** (`lvgl_port_lock()` / `lvgl_port_unlock()`).
+
+The copy-only design already in place makes this clean:
+`display_ui_set_context()` still only copies strings (safe from any task); the
+screen switch / label updates move behind the LVGL lock. Decide during
+implementation whether to (a) keep the existing `platform_ui_task()` pump and
+take the lock in the signal handlers, or (b) fully adopt `esp_lvgl_port`'s task
+and drop the manual pump. (a) is the smaller diff; (b) is more idiomatic.
+
+## Feature mapping (A / B / C)
+
+| Feature | RP2040 today | ESP32-S3 plan |
+|---------|--------------|---------------|
+| A Approve/Deny | LVGL confirm screen + `touch_accept_button`/`cancel_button`; RP/user via `display_ui_set_context()` | **Same UI/logic**; buttons/context unchanged. Confirm the ESP32 `button_wait()` path emits the presence signals and honours `touch_accept_button`. |
+| B Status | connection + **battery** | connection only (no battery HW); optional: show serial/label |
+| C Management | credential + OATH lists via `fido_ui_list_*()` | **Same**, unchanged |
+
+## The SDK "approve" hook
+
+The RP2040 fork wired the SDK's reserved `touch_accept_button` into
+`button_wait()` so an on-screen tap counts as a press. Confirm this same change
+is present/needed on the ESP32 `button_wait()` path in
+`MildlyTyped/pico-keys-sdk` (branch `touch-screen-support`); it is
+platform-independent C in `pico-keys-sdk/src/button.c` and should apply as-is.
+
+## Legacy RP2040 scaffold
+
+Kept in the repo as reference; **carries over unchanged** to ESP32-S3:
+
+- `src/display/display_ui.c` screen state machine, LVGL screen builders, signal
+  handlers, and the `refresh_list()` management lists — only the LVGL *binding*
+  (flush/input/tick) and locking change.
+- `src/display/lv_conf.h` — reusable (may instead be provided via `esp_lvgl_port`
+  Kconfig; RGB565 stays).
+- FIDO-side hooks: `display_ui_set_context()`, `fido_ui_list_credentials()`,
+  `fido_ui_list_oath()` (in `fido.c` / `credential.c` / `oath.c`).
+
+**Replaced on ESP32-S3:**
+
+- `src/display/st7789.c`, `cst816.c`, `battery.c` — RP2040 SPI/I2C/ADC drivers →
+  `esp_lcd` + `esp_lcd_touch_cst816s` (battery dropped).
+- `src/boards/waveshare_rp2040_touch_lcd_1_69.h` and the Pico-SDK board-header
+  install in `CMakeLists.txt` — not applicable on ESP-IDF.
+- `lib/lvgl` git submodule + `.S` filtering → `lvgl/lvgl` managed component.
+
+## Next steps
+
+1. **Branch/naming.** New work on a branch off `main` (e.g.
+   `devin/esp32s3-touch`). Decide whether to rename the repo focus from
+   `fido-touch` (RP2040) — kept as-is for now.
+2. **Bring up the ESP-IDF UI path.** In `CMakeLists.txt`, add an ESP32 display
+   path (register the display sources + `ENABLE_DISPLAY_UI`/`ENABLE_LVGL_UI` for
+   ESP-IDF) parallel to the RP2040 one; add `idf_component.yml` pulling
+   `lvgl/lvgl` (^9), `espressif/esp_lvgl_port`, `espressif/esp_lcd_touch_cst816s`.
+3. **Panel + touch init.** New `display_esp32.c` (or refactor `display_ui.c`'s
+   init): SPI bus, `esp_lcd` ST7789 panel, CST816 touch, `esp_lvgl_port`
+   display/indev. Move pins to Kconfig using the wiring table above.
+4. **Wire LVGL locking** into the signal handlers (or adopt the port task);
+   keep `display_ui_set_context()` copy-only.
+5. **Verify presence flow** end-to-end on ESP32: `button_wait()` emits the
+   signals and honours `touch_accept_button`/`cancel_button`.
+6. **Confirm pins & touch orientation** on the actual DevKit (rotation/mirror in
+   `esp_lcd`/LVGL); the 2" panel is 240×320 portrait.
+7. **Security hardening (deployment).** Once stable, enable Flash Encryption +
+   Secure Boot v2 in `sdkconfig` (release mode) and document eFuse burning.
+   Update the README/security note to reflect that this build *can* be
+   hardware-secured (unlike the RP2040 prototype).
+8. **Docs.** Keep this plan and the README fork note in sync as the port lands.
+
+## Open questions
+
+- Which exact ESP32-S3 DevKit (module/flash/PSRAM, USB-OTG vs UART bridge)? It
+  affects USB (native TinyUSB is required for HID/CCID) and available GPIOs.
+- Are the Waveshare reference GPIOs acceptable, or is there a preferred pinout?
+- Ship with Flash Encryption / Secure Boot from the start, or add after bring-up?
+- Keep the RP2040 scaffold in-tree as a second target, or remove it once the
+  ESP32-S3 path works?
