@@ -1,11 +1,15 @@
 # Pico FIDO Touch — ESP32-S3 + Waveshare 2" Capacitive Touch LCD
 
 > **Hardware pivot (2026-07).** The target moved from the RP2040-based
-> *Waveshare RP2040-Touch-LCD-1.69* to an **ESP32-S3 DevKit** driving the
-> external [Waveshare 2" Capacitive Touch LCD](https://www.waveshare.com/wiki/2inch_Capacitive_Touch_LCD).
-> This document is the ESP32-S3 plan. The earlier RP2040 scaffold (LVGL UI +
-> drivers under `src/display/`) still builds and is kept as a reference; see
-> [Legacy RP2040 scaffold](#legacy-rp2040-scaffold) for what carries over.
+> *Waveshare RP2040-Touch-LCD-1.69* to the **ESP32-S3-N16R8-EXT** DevKit
+> (16 MB flash, 8 MB octal PSRAM, native USB-OTG) driving the external
+> [Waveshare 2" Capacitive Touch LCD](https://www.waveshare.com/wiki/2inch_Capacitive_Touch_LCD).
+>
+> **Status: implemented.** The touch UI now builds on ESP-IDF v5.5 for the
+> ESP32-S3 using `esp_lcd` + `esp_lcd_touch_cst816s` + `esp_lvgl_port`, and the
+> RP2040 touchscreen scaffold has been **removed** (base RP2040 FIDO firmware is
+> unaffected). Not yet validated on physical hardware — pins, orientation, and
+> the end-to-end WebAuthn ceremony still need on-board bring-up.
 
 This describes how **pico-fido** is extended to use the touchscreen for three
 things, unchanged from the original goals:
@@ -33,9 +37,10 @@ this hardware the device can offer genuine hardware-backed protection — no
 longer just a prototype caveat.
 
 > ⚠️ Enabling Flash Encryption / Secure Boot **burns eFuses and is
-> irreversible**. Do it deliberately (release mode, key management, `espefuse`)
-> and only once the firmware is stable. It is a deployment/`sdkconfig` decision,
-> not a code change — see *Next steps*.
+> irreversible**. The build ships the config ready to go (`sdkconfig.defaults.secure`)
+> but it is **opt-in** and never applied by default — see
+> [Hardware security provisioning](#hardware-security-provisioning). Nothing in
+> ordinary `idf.py build` touches eFuses.
 
 ## Target hardware
 
@@ -68,21 +73,29 @@ trusting it.**
 | SD_CS    | GPIO38        | TP_SCL  | GPIO7         |
 | TP_INT   | GPIO17        | TP_RST  | GPIO16        |
 
-These become Kconfig/`sdkconfig` values (or a small `board_config.h`), not a
-Pico SDK board header.
+These pins are defined as `#define`s at the top of `src/display/display_ui.c`
+(MISO is unused — the panel is write-only), not a Pico SDK board header.
 
 ## How it builds on ESP32-S3 (ESP-IDF)
 
 pico-fido **already supports ESP32** via ESP-IDF — the top-level
 `CMakeLists.txt` has an `ESP_PLATFORM` branch that registers `src/fido` and the
 `pico-keys-sdk/config/esp32/components/*` components and includes
-`$IDF_PATH/tools/cmake/project.cmake`. Build is:
+`$IDF_PATH/tools/cmake/project.cmake`. The touch UI is enabled with
+`-DENABLE_DISPLAY_UI=1`, which adds `src/display` as an ESP-IDF component (its
+`idf_component.yml` pulls `lvgl` 9.3, `esp_lvgl_port`, `esp_lcd_touch_cst816s`)
+and applies the `sdkconfig.defaults.display` fragment (LVGL fonts, RGB565).
+Build:
 
 ```sh
-idf.py set-target esp32s3
-idf.py menuconfig      # enable OATH/OTP, display UI, pins; later: flash enc / secure boot
-idf.py build flash monitor
+. ~/esp-idf/export.sh
+idf.py -B build-esp -DENABLE_DISPLAY_UI=1 set-target esp32s3
+idf.py -B build-esp build          # -> build-esp/pico_fido.bin
+idf.py -B build-esp flash monitor
 ```
+
+A plain `idf.py set-target esp32s3 && idf.py build` (no `ENABLE_DISPLAY_UI`)
+still produces the headless FIDO firmware.
 
 The same SDK seams the RP2040 UI uses are **already wired on ESP32**:
 
@@ -97,10 +110,7 @@ The same SDK seams the RP2040 UI uses are **already wired on ESP32**:
   over unchanged: `display_ui_set_context()` (Approve-screen context) and
   `fido_ui_list_credentials()` / `fido_ui_list_oath()` (management lists).
 
-**What currently blocks the ESP32 UI:** the display integration is gated
-`AND NOT ESP_PLATFORM` in `CMakeLists.txt` (the RP2040 path pulls in the Pico
-SDK, the `lib/lvgl` git submodule, and bit-banged drivers). The port replaces
-that path, not the UI logic.
+
 
 ## Display / touch / LVGL architecture on ESP-IDF
 
@@ -125,77 +135,97 @@ mutates LVGL objects from another task (e.g. a signal handler dispatched on the
 FIDO task) **must hold the port lock** (`lvgl_port_lock()` / `lvgl_port_unlock()`).
 
 The copy-only design already in place makes this clean:
-`display_ui_set_context()` still only copies strings (safe from any task); the
-screen switch / label updates move behind the LVGL lock. Decide during
-implementation whether to (a) keep the existing `platform_ui_task()` pump and
-take the lock in the signal handlers, or (b) fully adopt `esp_lvgl_port`'s task
-and drop the manual pump. (a) is the smaller diff; (b) is more idiomatic.
+`display_ui_set_context()` still only copies strings (safe from any task). The
+implementation uses **`esp_lvgl_port`'s own LVGL task** for rendering/timers, and
+every signal handler and `platform_ui_task()` update takes the port lock
+(`lvgl_port_lock()`/`lvgl_port_unlock()`) around any LVGL object access.
 
 ## Feature mapping (A / B / C)
 
-| Feature | RP2040 today | ESP32-S3 plan |
-|---------|--------------|---------------|
-| A Approve/Deny | LVGL confirm screen + `touch_accept_button`/`cancel_button`; RP/user via `display_ui_set_context()` | **Same UI/logic**; buttons/context unchanged. Confirm the ESP32 `button_wait()` path emits the presence signals and honours `touch_accept_button`. |
-| B Status | connection + **battery** | connection only (no battery HW); optional: show serial/label |
-| C Management | credential + OATH lists via `fido_ui_list_*()` | **Same**, unchanged |
+| Feature | Original RP2040 | ESP32-S3 |
+|---------|-----------------|----------|
+| A Approve/Deny | LVGL confirm screen + `touch_accept_button`/`cancel_button`; RP/user via `display_ui_set_context()` | **Implemented**, same UI/logic; buttons/context unchanged. |
+| B Status | connection + **battery** | connection only (battery dropped) |
+| C Management | credential + OATH lists via `fido_ui_list_*()` | **Implemented**, unchanged |
 
 ## The SDK "approve" hook
 
-The RP2040 fork wired the SDK's reserved `touch_accept_button` into
-`button_wait()` so an on-screen tap counts as a press. Confirm this same change
-is present/needed on the ESP32 `button_wait()` path in
-`MildlyTyped/pico-keys-sdk` (branch `touch-screen-support`); it is
-platform-independent C in `pico-keys-sdk/src/button.c` and should apply as-is.
+The fork wired the SDK's reserved `touch_accept_button` into `button_wait()` so
+an on-screen tap counts as a press. This is platform-independent C in
+`pico-keys-sdk/src/button.c` (branch `touch-screen-support`) and applies
+unchanged on ESP32. On-hardware verification that the ESP32 `button_wait()` path
+emits the presence signals and honours `touch_accept_button`/`cancel_button` is
+still pending a physical board.
 
-## Legacy RP2040 scaffold
+## What carried over vs. what was removed
 
-Kept in the repo as reference; **carries over unchanged** to ESP32-S3:
+**Carried over unchanged** (platform-independent):
 
 - `src/display/display_ui.c` screen state machine, LVGL screen builders, signal
-  handlers, and the `refresh_list()` management lists — only the LVGL *binding*
-  (flush/input/tick) and locking change.
-- `src/display/lv_conf.h` — reusable (may instead be provided via `esp_lvgl_port`
-  Kconfig; RGB565 stays).
+  handlers, and the management lists — only the LVGL *binding* (panel/touch
+  init + locking) is ESP-IDF-specific now.
 - FIDO-side hooks: `display_ui_set_context()`, `fido_ui_list_credentials()`,
   `fido_ui_list_oath()` (in `fido.c` / `credential.c` / `oath.c`).
 
-**Replaced on ESP32-S3:**
+**Removed with the RP2040 pivot:**
 
 - `src/display/st7789.c`, `cst816.c`, `battery.c` — RP2040 SPI/I2C/ADC drivers →
   `esp_lcd` + `esp_lcd_touch_cst816s` (battery dropped).
+- `src/display/lv_conf.h` → LVGL configured via `esp_lvgl_port` Kconfig +
+  `sdkconfig.defaults.display`.
 - `src/boards/waveshare_rp2040_touch_lcd_1_69.h` and the Pico-SDK board-header
   install in `CMakeLists.txt` — not applicable on ESP-IDF.
 - `lib/lvgl` git submodule + `.S` filtering → `lvgl/lvgl` managed component.
 
-## Next steps
+## Hardware security provisioning
 
-1. **Branch/naming.** New work on a branch off `main` (e.g.
-   `devin/esp32s3-touch`). Decide whether to rename the repo focus from
-   `fido-touch` (RP2040) — kept as-is for now.
-2. **Bring up the ESP-IDF UI path.** In `CMakeLists.txt`, add an ESP32 display
-   path (register the display sources + `ENABLE_DISPLAY_UI`/`ENABLE_LVGL_UI` for
-   ESP-IDF) parallel to the RP2040 one; add `idf_component.yml` pulling
-   `lvgl/lvgl` (^9), `espressif/esp_lvgl_port`, `espressif/esp_lcd_touch_cst816s`.
-3. **Panel + touch init.** New `display_esp32.c` (or refactor `display_ui.c`'s
-   init): SPI bus, `esp_lcd` ST7789 panel, CST816 touch, `esp_lvgl_port`
-   display/indev. Move pins to Kconfig using the wiring table above.
-4. **Wire LVGL locking** into the signal handlers (or adopt the port task);
-   keep `display_ui_set_context()` copy-only.
-5. **Verify presence flow** end-to-end on ESP32: `button_wait()` emits the
-   signals and honours `touch_accept_button`/`cancel_button`.
-6. **Confirm pins & touch orientation** on the actual DevKit (rotation/mirror in
-   `esp_lcd`/LVGL); the 2" panel is 240×320 portrait.
-7. **Security hardening (deployment).** Once stable, enable Flash Encryption +
-   Secure Boot v2 in `sdkconfig` (release mode) and document eFuse burning.
-   Update the README/security note to reflect that this build *can* be
-   hardware-secured (unlike the RP2040 prototype).
-8. **Docs.** Keep this plan and the README fork note in sync as the port lands.
+The firmware ships **ready** for Flash Encryption + Secure Boot v2, but never
+enables them automatically — burning eFuses is irreversible and must be a
+deliberate provisioning step on the real board. The config lives in
+`sdkconfig.defaults.secure` (opt-in) and moves the partition table to `0x10000`
+(the signed bootloader is larger than the default `0x8000` offset).
 
-## Open questions
+```sh
+. ~/esp-idf/export.sh
 
-- Which exact ESP32-S3 DevKit (module/flash/PSRAM, USB-OTG vs UART bridge)? It
-  affects USB (native TinyUSB is required for HID/CCID) and available GPIOs.
-- Are the Waveshare reference GPIOs acceptable, or is there a preferred pinout?
-- Ship with Flash Encryption / Secure Boot from the start, or add after bring-up?
-- Keep the RP2040 scaffold in-tree as a second target, or remove it once the
-  ESP32-S3 path works?
+# 1. Generate an RSA-3072 Secure Boot v2 signing key. Keep it OFFLINE and out of
+#    git (.gitignore already excludes *.pem). Losing it means no more updates.
+espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem
+
+# 2. Configure + build with the secure fragment appended.
+idf.py -B build-secure \
+  -DENABLE_DISPLAY_UI=1 \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.display;sdkconfig.defaults.secure" \
+  set-target esp32s3
+idf.py -B build-secure build
+
+# 3. FIRST FLASH BURNS eFUSES (Secure Boot key digest + Flash Encryption key)
+#    and encrypts flash in place. Irreversible. Do it once, on the target board.
+idf.py -B build-secure flash monitor
+```
+
+After provisioning, resident keys/seeds are encrypted at rest with a key held in
+eFuse, and only firmware signed with your key boots. Until this is actually run
+on hardware, **do not claim the device is hardware-secured** — the default build
+is functionally identical to an unprotected one.
+
+## Remaining work (needs physical hardware)
+
+Code is complete and all targets build; the following need the actual board:
+
+1. **Confirm pins & touch orientation** on the DevKit (rotation/mirror in the
+   `esp_lcd_touch_config_t.flags` / panel config); the 2" panel is 240×320.
+2. **Verify colour/inversion** (`esp_lcd_panel_invert_color`) and backlight on
+   GPIO6.
+3. **Verify the presence flow** end-to-end: `button_wait()` emits the signals
+   and honours `touch_accept_button`/`cancel_button` during a real WebAuthn
+   ceremony.
+4. **Provision security** per the section above once bring-up is stable.
+
+## Decisions (previously open questions)
+
+- **Board:** ESP32-S3-N16R8-EXT (16 MB flash, 8 MB octal PSRAM, native USB-OTG).
+- **Pinout:** Waveshare reference GPIOs (table above).
+- **Security:** enabled from the start as an opt-in, ready-to-provision config
+  (`sdkconfig.defaults.secure`); eFuses are only burned during provisioning.
+- **RP2040 scaffold:** removed now that the ESP32-S3 target builds.
