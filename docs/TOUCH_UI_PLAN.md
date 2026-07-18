@@ -85,17 +85,109 @@ pico-fido **already supports ESP32** via ESP-IDF — the top-level
 `-DENABLE_DISPLAY_UI=1`, which adds `src/display` as an ESP-IDF component (its
 `idf_component.yml` pulls `lvgl` 9.3, `esp_lvgl_port`, `esp_lcd_touch_cst816s`)
 and applies the `sdkconfig.defaults.display` fragment (LVGL fonts, RGB565).
-Build:
+
+> **Toolchain, in plain terms.** `esptool` only *flashes* a prebuilt binary; it
+> cannot compile firmware. **Compiling requires ESP-IDF**, which bundles
+> `esptool.py`, `espefuse.py`, and the serial monitor. So the flow is: install
+> ESP-IDF once, build, then flash (with `idf.py flash` *or* bare `esptool.py`).
+
+See [macOS: setup → build → flash → bring-up](#macos-setup--build--flash--bring-up)
+for the full walkthrough.
+
+## macOS: setup → build → flash → bring-up
+
+Tested layout: ESP-IDF **v5.5** installed at `~/esp/esp-idf`. The
+ESP32-S3-N16R8-EXT enumerates over **native USB** (USB-OTG), so on macOS it
+appears as a `/dev/cu.usbmodem*` port with no extra driver.
+
+### 1. Install prerequisites (Homebrew)
 
 ```sh
-. ~/esp-idf/export.sh
+# Homebrew (skip if already installed): https://brew.sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# ESP-IDF's own prerequisites on macOS
+brew install cmake ninja dfu-util python git
+```
+
+### 2. Install ESP-IDF v5.5 + the ESP32-S3 toolchain
+
+```sh
+mkdir -p ~/esp && cd ~/esp
+git clone -b v5.5 --recursive https://github.com/espressif/esp-idf.git
+cd ~/esp/esp-idf
+./install.sh esp32s3        # downloads the xtensa-esp32s3 compiler + tools
+```
+
+Load the environment in **every new terminal** before building/flashing (this is
+what puts `idf.py`, `esptool.py`, `espefuse.py` on your `PATH`):
+
+```sh
+. ~/esp/esp-idf/export.sh
+```
+
+### 3. Get the code (with submodules) and build
+
+```sh
+git clone --recursive https://github.com/MildlyTyped/fido-touch.git
+cd fido-touch
+# if you cloned without --recursive:
+git submodule update --init --recursive
+
+. ~/esp/esp-idf/export.sh
 idf.py -B build-esp -DENABLE_DISPLAY_UI=1 set-target esp32s3
 idf.py -B build-esp build          # -> build-esp/pico_fido.bin
-idf.py -B build-esp flash monitor
 ```
 
 A plain `idf.py set-target esp32s3 && idf.py build` (no `ENABLE_DISPLAY_UI`)
-still produces the headless FIDO firmware.
+produces the headless FIDO firmware instead.
+
+### 4. Find the serial port
+
+Put the board in download mode if needed (hold **BOOT**, tap **RESET**, release
+**BOOT**), then:
+
+```sh
+ls /dev/cu.usbmodem*       # e.g. /dev/cu.usbmodem101
+```
+
+### 5. Flash
+
+Easiest (ESP-IDF wrapper):
+
+```sh
+idf.py -B build-esp -p /dev/cu.usbmodem101 flash monitor
+```
+
+Or with **bare esptool** (no `idf.py`) — exact offsets come from
+`build-esp/flasher_args.json`; the standard (non-secure) build is:
+
+```sh
+esptool.py --chip esp32s3 -p /dev/cu.usbmodem101 -b 460800 \
+  --before default_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
+  0x0     build-esp/bootloader/bootloader.bin \
+  0x8000  build-esp/partition_table/partition-table.bin \
+  0x20000 build-esp/pico_fido.bin
+```
+
+### 6. Bring-up / monitor
+
+```sh
+idf.py -B build-esp -p /dev/cu.usbmodem101 monitor   # Ctrl-] to quit
+# or any serial terminal at 115200 baud:
+#   screen /dev/cu.usbmodem101 115200
+```
+
+First-boot checklist on the actual board:
+
+1. Serial log shows the panel + touch init with no `ESP_ERROR_CHECK` aborts.
+2. Backlight (GPIO6) on; the status screen renders (fix colours with
+   `esp_lcd_panel_invert_color`, orientation with the panel/`esp_lcd_touch`
+   mirror/swap flags in `src/display/display_ui.c`).
+3. A touch registers at the right coordinates (adjust `swap_xy`/`mirror_*`).
+4. The host sees a FIDO authenticator over USB; a WebAuthn registration shows
+   the Approve/Deny screen with the relying party, and a tap approves.
 
 The same SDK seams the RP2040 UI uses are **already wired on ESP32**:
 
@@ -186,7 +278,7 @@ deliberate provisioning step on the real board. The config lives in
 (the signed bootloader is larger than the default `0x8000` offset).
 
 ```sh
-. ~/esp-idf/export.sh
+. ~/esp/esp-idf/export.sh
 
 # 1. Generate an RSA-3072 Secure Boot v2 signing key. Keep it OFFLINE and out of
 #    git (.gitignore already excludes *.pem). Losing it means no more updates.
@@ -201,7 +293,13 @@ idf.py -B build-secure build
 
 # 3. FIRST FLASH BURNS eFUSES (Secure Boot key digest + Flash Encryption key)
 #    and encrypts flash in place. Irreversible. Do it once, on the target board.
-idf.py -B build-secure flash monitor
+#    idf.py sequences the irreversible steps safely; prefer it over bare esptool
+#    for the secure flow (the offsets/encryption differ from the normal build -
+#    see build-secure/flasher_args.json).
+idf.py -B build-secure -p /dev/cu.usbmodem101 flash monitor
+
+# 4. Inspect what was burned (read-only):
+espefuse.py -p /dev/cu.usbmodem101 summary
 ```
 
 After provisioning, resident keys/seeds are encrypted at rest with a key held in
