@@ -81,16 +81,20 @@ core 0, there is no cross-core race.
 | `board_config.h`| All pin / bus / geometry constants for the board.                 |
 | `st7789.c/.h`   | ST7789V2 SPI driver: init, fill-rect, blit, backlight.            |
 | `cst816.c/.h`   | CST816T I2C touch driver: init + `cst816_read()` (point + gesture)|
-| `gfx.c/.h`      | Tiny renderer: scaled 8×8 text + centred text on top of ST7789.   |
 | `battery.c/.h`  | ADC battery voltage → percent.                                    |
-| `display_ui.c/.h`| Screen state machine, signal handlers, `platform_ui_task/init`.  |
-| `font8x8_basic.h`| Vendored public-domain 8×8 bitmap font.                          |
+| `display_ui.c/.h`| LVGL screens, signal handlers, `platform_ui_task/init`.          |
+| `lv_conf.h`     | Minimal LVGL config (RGB565, 32 KB pool, Montserrat fonts).       |
 | `../boards/waveshare_rp2040_touch_lcd_1_69.h` | Pico SDK board header (16 MB flash). |
+| `../../lib/lvgl` | LVGL v9.2.2 submodule (UI toolkit).                              |
 
-The renderer is intentionally **dependency-free** (no LVGL) so the scaffold
-compiles and links with the stock Pico SDK. LVGL remains an option — the SDK
-hook is still named after it — and is the recommended path for a richer UI
-(see *Follow-ups*).
+The UI is built with **LVGL** (v9.2.2, vendored as the `lib/lvgl` submodule).
+`display_ui.c` provides the two LVGL platform callbacks — a display *flush* that
+pushes rendered tiles through `st7789_blit()`, and a pointer *input* read that
+wraps `cst816_read()` — plus a runtime tick from `board_millis()`. Rendering is
+**partial** (a 240×40 RGB565 draw buffer, ~19 KB) to fit RP2040 SRAM, and the
+Helium/Neon assembly accelerators are excluded from the LVGL build (the C
+blenders are used instead). Screens are plain LVGL objects switched with
+`lv_screen_load()`; `lv_timer_handler()` is pumped from `platform_ui_task()`.
 
 ## Screens
 
@@ -112,14 +116,17 @@ cd fido-touch
 mkdir build && cd build
 PICO_SDK_PATH=/path/to/pico-sdk cmake .. \
     -DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69 \
-    -DPICO_BOARD_HEADER_DIRS=$(pwd)/../src/boards \
     -DENABLE_DISPLAY_UI=1
 make -j4
 ```
 
-`-DPICO_BOARD=pico` also works (2 MB flash assumed). Copy `pico_fido.uf2` to the
-board in BOOTSEL mode. `ENABLE_DISPLAY_UI` defaults to **OFF**, so non-display
-builds are unaffected.
+Selecting `-DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69` installs the bundled
+board header into the Pico SDK's board dir at configure time (the pico-keys SDK
+reads it directly from there), so no `-DPICO_BOARD_HEADER_DIRS` is needed.
+`-DPICO_BOARD=pico` also works (2 MB flash assumed). Enabling the UI defines
+both `ENABLE_DISPLAY_UI` and `ENABLE_LVGL_UI` (the SDK's reserved task hook) and
+links LVGL. Copy `pico_fido.uf2` to the board in BOOTSEL mode.
+`ENABLE_DISPLAY_UI` defaults to **OFF**, so non-display builds are unaffected.
 
 ## Follow-ups (scaffolded but not finished)
 
@@ -133,8 +140,8 @@ builds are unaffected.
 4. **PWM backlight** dimming (vendor demo uses PWM on GP25) and screen
    blanking / low-power sleep when idle to save battery.
 5. **IMU (QMI8658)** — optional orientation / tap-to-wake.
-6. **LVGL option** — swap the `gfx` renderer for LVGL behind `ENABLE_LVGL_UI`
-   for richer widgets; the SDK hook already supports it.
+6. **Richer LVGL UI** — the toolkit is in place; add themes, animations, a
+   scrollable credential list, and QR/large fonts as needed.
 7. **Security note** — the RP2040 has no secure key storage (see the main
    README). A display does not change that; do not present it as a hardware
    security module.
@@ -143,12 +150,14 @@ builds are unaffected.
 
 ## Testing
 
-- **Host build check:** the CI/emulation build (`-DENABLE_EMULATION=1`) is
-  unaffected — the display sources are excluded from that target by CMake, and
-  as a safety net the driver hardware code is also guarded behind
-  `#ifndef ENABLE_EMULATION`.
-- **Board build check:** `-DENABLE_DISPLAY_UI=1` produces a valid
-  `pico_fido.uf2` (verified in this branch).
+- **Host build check:** the display/LVGL sources are excluded from the
+  emulation target (`-DENABLE_EMULATION=1`) by CMake, and the driver hardware
+  code is additionally guarded behind `#ifndef ENABLE_EMULATION`, so this change
+  does not affect it. (The emulation binary separately needs the `tss2` TPM
+  headers, unrelated to the display work.)
+- **Board build check:** `-DPICO_BOARD=waveshare_rp2040_touch_lcd_1_69
+  -DENABLE_DISPLAY_UI=1` produces a valid `pico_fido.uf2` with LVGL linked
+  (verified in this branch; ~126 KB SRAM/BSS used).
 - **On hardware (to do):** confirm panel init/colours, touch coordinates,
   approve/deny flow end-to-end against a WebAuthn test page, and battery
   reading.

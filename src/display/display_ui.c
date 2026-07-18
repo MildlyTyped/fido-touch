@@ -1,18 +1,29 @@
 /*
  * This file is part of the Pico FIDO Touch distribution.
  *
- * Touchscreen UI layer, see display_ui.h.
+ * LVGL-based touchscreen UI layer, see display_ui.h.
+ *
+ * Screens:
+ *   A) SCREEN_CONFIRM  - Approve/Deny prompt for FIDO user presence.
+ *   B) SCREEN_STATUS   - idle status + battery (default screen).
+ *   C) SCREEN_MENU + sub-screens - management UI skeleton.
+ *
+ * LVGL runs single-threaded on core 0: platform_ui_task() (called from the
+ * SDK's execute_tasks()) drives lv_timer_handler(), and the presence/USB
+ * signal handlers - also dispatched on core 0 - just switch the active
+ * screen, so there is no cross-core access to LVGL.
  */
 
 #include "display_ui.h"
 #include "board_config.h"
 #include "st7789.h"
-#include "gfx.h"
 #include "cst816.h"
 #include "battery.h"
 
 #include <string.h>
 #include <stdio.h>
+
+#include "lvgl.h"
 
 #include "picokeys.h"
 #include "signal.h"
@@ -31,14 +42,10 @@ typedef enum {
     SCREEN_CREDENTIALS,
     SCREEN_OATH,
     SCREEN_INFO,
+    SCREEN_COUNT,
 } ui_screen_t;
 
-typedef struct {
-    int x, y, w, h;
-} ui_rect_t;
-
 static ui_screen_t g_screen = SCREEN_STATUS;
-static bool g_dirty = true;
 static bool g_mounted = false;
 
 /* Confirm-screen context. */
@@ -48,181 +55,264 @@ static int g_confirm_last_remaining = -1;
 static char g_ctx_rp[40] = {0};
 static char g_ctx_user[40] = {0};
 
-/* Touch edge detection + polling cadence. */
-static bool g_prev_pressed = false;
-static uint32_t g_next_poll_ms = 0;
 static uint32_t g_next_status_ms = 0;
 
-/* Layout: confirm-screen buttons. */
-static const ui_rect_t BTN_APPROVE = { 15, 170, 210, 45 };
-static const ui_rect_t BTN_DENY    = { 15, 225, 210, 45 };
+/* ----- LVGL objects ----------------------------------------------------- */
+static lv_display_t *g_disp = NULL;
+static lv_indev_t *g_indev = NULL;
 
-/* Layout: menu rows. */
-#define MENU_ITEM_COUNT 4
-static const char *const MENU_ITEMS[MENU_ITEM_COUNT] = {
-    "Credentials", "OATH codes", "Device info", "Back"
-};
-static const ui_rect_t MENU_ROWS[MENU_ITEM_COUNT] = {
-    { 10, 55, 220, 42 },
-    { 10, 105, 220, 42 },
-    { 10, 155, 220, 42 },
-    { 10, 205, 220, 42 },
-};
+static lv_obj_t *g_screens[SCREEN_COUNT] = {0};
+static lv_obj_t *lbl_state = NULL;   /* status: Ready / Connected */
+static lv_obj_t *lbl_batt = NULL;    /* status: battery %          */
+static lv_obj_t *lbl_rp = NULL;      /* confirm: relying party     */
+static lv_obj_t *lbl_user = NULL;    /* confirm: user name         */
+static lv_obj_t *lbl_count = NULL;   /* confirm: countdown         */
 
-static bool rect_hit(const ui_rect_t *r, int x, int y) {
-    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+/* Draw buffer: partial rendering, LCD_WIDTH * N lines of RGB565. */
+#define DRAW_BUF_LINES 40
+static uint8_t g_draw_buf[LCD_WIDTH * DRAW_BUF_LINES * 2]
+    __attribute__((aligned(4)));
+
+/* ----- Colours ---------------------------------------------------------- */
+static inline lv_color_t col_white(void) { return lv_color_white(); }
+static inline lv_color_t col_grey(void)  { return lv_color_make(0x9a, 0xa0, 0xac); }
+static inline lv_color_t col_green(void) { return lv_color_make(0x1f, 0xa8, 0x55); }
+static inline lv_color_t col_red(void)   { return lv_color_make(0xe0, 0x1b, 0x24); }
+static inline lv_color_t col_yellow(void){ return lv_color_make(0xf2, 0xc0, 0x1e); }
+
+/* ----- LVGL hardware callbacks ------------------------------------------ */
+static uint32_t tick_cb(void) {
+    return board_millis();
 }
 
-/* ----- Drawing ---------------------------------------------------------- */
-static void draw_button(const ui_rect_t *r, const char *label, uint16_t bg,
-                        uint16_t fg) {
-    st7789_fill_rect(r->x, r->y, r->w, r->h, bg);
-    int scale = 2;
-    int tw = gfx_text_width(label, scale);
-    int tx = r->x + (r->w - tw) / 2;
-    int ty = r->y + (r->h - GFX_GLYPH_H * scale) / 2;
-    gfx_draw_text(tx, ty, label, scale, fg, bg);
+static void disp_flush(lv_display_t *disp, const lv_area_t *area,
+                       uint8_t *px_map) {
+    int w = area->x2 - area->x1 + 1;
+    int h = area->y2 - area->y1 + 1;
+    st7789_blit(area->x1, area->y1, w, h, (const uint16_t *)px_map);
+    lv_display_flush_ready(disp);
 }
 
-static void draw_status_screen(void) {
-    st7789_clear(ST7789_BLACK);
-    gfx_draw_text_centered(24, "PICO FIDO", 3, ST7789_WHITE, ST7789_BLACK);
-    gfx_draw_text_centered(60, "touch key", 1, ST7789_GREY, ST7789_BLACK);
-
-    gfx_draw_text_centered(110, g_mounted ? "Connected" : "Ready",
-                           2, g_mounted ? ST7789_GREEN : ST7789_YELLOW,
-                           ST7789_BLACK);
-
-    char batt[24];
-    int pct = battery_read_percent();
-    if (pct >= 0) {
-        snprintf(batt, sizeof(batt), "Battery %d%%", pct);
+static void touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    (void)indev;
+    static int32_t last_x = 0, last_y = 0;
+    cst816_touch_t t;
+    if (cst816_read(&t)) {
+        last_x = t.x;
+        last_y = t.y;
+        if (last_x >= LCD_WIDTH)  { last_x = LCD_WIDTH - 1; }
+        if (last_y >= LCD_HEIGHT) { last_y = LCD_HEIGHT - 1; }
+        data->state = LV_INDEV_STATE_PRESSED;
     } else {
-        snprintf(batt, sizeof(batt), "Battery --");
+        data->state = LV_INDEV_STATE_RELEASED;
     }
-    gfx_draw_text_centered(160, batt, 2, ST7789_WHITE, ST7789_BLACK);
-
-    gfx_draw_text_centered(250, "tap for menu", 1, ST7789_GREY, ST7789_BLACK);
+    data->point.x = last_x;
+    data->point.y = last_y;
 }
 
-static void draw_confirm_static(void) {
-    st7789_clear(ST7789_BLACK);
-    gfx_draw_text_centered(16, "CONFIRM", 3, ST7789_YELLOW, ST7789_BLACK);
-
-    if (g_ctx_rp[0]) {
-        gfx_draw_text_centered(64, g_ctx_rp, 2, ST7789_WHITE, ST7789_BLACK);
-    } else {
-        gfx_draw_text_centered(64, "User presence", 2, ST7789_WHITE,
-                               ST7789_BLACK);
+/* ----- Navigation ------------------------------------------------------- */
+static void show_screen(ui_screen_t s) {
+    if (s >= SCREEN_COUNT || g_screens[s] == NULL) {
+        return;
     }
-    if (g_ctx_user[0]) {
-        gfx_draw_text_centered(96, g_ctx_user, 1, ST7789_GREY, ST7789_BLACK);
-    }
-
-    draw_button(&BTN_APPROVE, "APPROVE", ST7789_GREEN, ST7789_BLACK);
-    draw_button(&BTN_DENY, "DENY", ST7789_RED, ST7789_WHITE);
+    g_screen = s;
+    lv_screen_load(g_screens[s]);
 }
 
-static void draw_confirm_countdown(int remaining) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%ds", remaining < 0 ? 0 : remaining);
-    /* Clear the small countdown band then redraw. */
-    st7789_fill_rect(0, 128, LCD_WIDTH, 28, ST7789_BLACK);
-    gfx_draw_text_centered(130, buf, 2, ST7789_GREY, ST7789_BLACK);
+static void nav_cb(lv_event_t *e) {
+    ui_screen_t tgt = (ui_screen_t)(intptr_t)lv_event_get_user_data(e);
+    show_screen(tgt);
 }
 
-static void draw_list_screen(const char *title, const char *const *items,
-                             const ui_rect_t *rows, int count) {
-    st7789_clear(ST7789_BLACK);
-    gfx_draw_text_centered(14, title, 2, ST7789_WHITE, ST7789_BLACK);
-    for (int i = 0; i < count; i++) {
-        bool is_back = (strcmp(items[i], "Back") == 0);
-        draw_button(&rows[i], items[i],
-                    is_back ? ST7789_GREY : ST7789_BLUE, ST7789_WHITE);
-    }
+static void approve_cb(lv_event_t *e) {
+    (void)e;
+    touch_accept_button = true;
 }
 
-static void draw_info_screen(const char *title, const char *line1,
-                             const char *line2) {
-    st7789_clear(ST7789_BLACK);
-    gfx_draw_text_centered(14, title, 2, ST7789_WHITE, ST7789_BLACK);
+static void deny_cb(lv_event_t *e) {
+    (void)e;
+    cancel_button = true;
+}
+
+/* ----- Screen builders -------------------------------------------------- */
+static lv_obj_t *make_screen(void) {
+    lv_obj_t *s = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+    return s;
+}
+
+static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
+                            const lv_font_t *font, lv_color_t color) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, color, 0);
+    return l;
+}
+
+static void build_status_screen(void) {
+    lv_obj_t *s = make_screen();
+    g_screens[SCREEN_STATUS] = s;
+
+    lv_obj_t *title = make_label(s, "PICO FIDO", &lv_font_montserrat_28,
+                                 col_white());
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+
+    lv_obj_t *sub = make_label(s, "touch key", &lv_font_montserrat_14,
+                               col_grey());
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 56);
+
+    lbl_state = make_label(s, "Ready", &lv_font_montserrat_20, col_yellow());
+    lv_obj_align(lbl_state, LV_ALIGN_CENTER, 0, -10);
+
+    lbl_batt = make_label(s, "Battery --", &lv_font_montserrat_20, col_white());
+    lv_obj_align(lbl_batt, LV_ALIGN_CENTER, 0, 40);
+
+    lv_obj_t *hint = make_label(s, "tap for menu", &lv_font_montserrat_14,
+                                col_grey());
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -14);
+
+    lv_obj_add_flag(s, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s, nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCREEN_MENU);
+}
+
+static void build_confirm_screen(void) {
+    lv_obj_t *s = make_screen();
+    g_screens[SCREEN_CONFIRM] = s;
+
+    lv_obj_t *title = make_label(s, "CONFIRM", &lv_font_montserrat_28,
+                                 col_yellow());
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+    lbl_rp = make_label(s, "User presence", &lv_font_montserrat_20,
+                        col_white());
+    lv_obj_set_width(lbl_rp, LCD_WIDTH - 20);
+    lv_obj_set_style_text_align(lbl_rp, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(lbl_rp, LV_LABEL_LONG_DOT);
+    lv_obj_align(lbl_rp, LV_ALIGN_TOP_MID, 0, 58);
+
+    lbl_user = make_label(s, "", &lv_font_montserrat_14, col_grey());
+    lv_obj_set_width(lbl_user, LCD_WIDTH - 20);
+    lv_obj_set_style_text_align(lbl_user, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(lbl_user, LV_LABEL_LONG_DOT);
+    lv_obj_align(lbl_user, LV_ALIGN_TOP_MID, 0, 88);
+
+    lbl_count = make_label(s, "", &lv_font_montserrat_20, col_grey());
+    lv_obj_align(lbl_count, LV_ALIGN_TOP_MID, 0, 116);
+
+    lv_obj_t *btn_ok = lv_button_create(s);
+    lv_obj_set_size(btn_ok, LCD_WIDTH - 30, 46);
+    lv_obj_align(btn_ok, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_set_style_bg_color(btn_ok, col_green(), 0);
+    lv_obj_t *l_ok = make_label(btn_ok, "APPROVE", &lv_font_montserrat_20,
+                                col_white());
+    lv_obj_center(l_ok);
+    lv_obj_add_event_cb(btn_ok, approve_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_no = lv_button_create(s);
+    lv_obj_set_size(btn_no, LCD_WIDTH - 30, 46);
+    lv_obj_align(btn_no, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(btn_no, col_red(), 0);
+    lv_obj_t *l_no = make_label(btn_no, "DENY", &lv_font_montserrat_20,
+                                col_white());
+    lv_obj_center(l_no);
+    lv_obj_add_event_cb(btn_no, deny_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static lv_obj_t *add_menu_item(lv_obj_t *list, const char *text,
+                               ui_screen_t target) {
+    lv_obj_t *b = lv_list_add_button(list, NULL, text);
+    lv_obj_add_event_cb(b, nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)target);
+    return b;
+}
+
+static void build_menu_screen(void) {
+    lv_obj_t *s = make_screen();
+    g_screens[SCREEN_MENU] = s;
+
+    lv_obj_t *title = make_label(s, "Menu", &lv_font_montserrat_20,
+                                 col_white());
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *list = lv_list_create(s);
+    lv_obj_set_size(list, LCD_WIDTH, LCD_HEIGHT - 44);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    add_menu_item(list, "Credentials", SCREEN_CREDENTIALS);
+    add_menu_item(list, "OATH codes", SCREEN_OATH);
+    add_menu_item(list, "Device info", SCREEN_INFO);
+    add_menu_item(list, "Back", SCREEN_STATUS);
+}
+
+static void build_info_screen(ui_screen_t which, const char *title,
+                              const char *line1, const char *line2) {
+    lv_obj_t *s = make_screen();
+    g_screens[which] = s;
+
+    lv_obj_t *t = make_label(s, title, &lv_font_montserrat_20, col_white());
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
+
     if (line1) {
-        gfx_draw_text_centered(80, line1, 1, ST7789_GREY, ST7789_BLACK);
+        lv_obj_t *l1 = make_label(s, line1, &lv_font_montserrat_16,
+                                  col_grey());
+        lv_obj_align(l1, LV_ALIGN_CENTER, 0, -12);
     }
     if (line2) {
-        gfx_draw_text_centered(110, line2, 1, ST7789_GREY, ST7789_BLACK);
+        lv_obj_t *l2 = make_label(s, line2, &lv_font_montserrat_16,
+                                  col_grey());
+        lv_obj_align(l2, LV_ALIGN_CENTER, 0, 14);
     }
-    draw_button(&MENU_ROWS[3], "Back", ST7789_GREY, ST7789_WHITE);
+
+    lv_obj_t *back = lv_button_create(s);
+    lv_obj_set_size(back, LCD_WIDTH - 30, 44);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_t *lb = make_label(back, "Back", &lv_font_montserrat_20,
+                              col_white());
+    lv_obj_center(lb);
+    lv_obj_add_event_cb(back, nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCREEN_MENU);
 }
 
-static void render_current_screen(void) {
-    switch (g_screen) {
-    case SCREEN_STATUS:
-        draw_status_screen();
-        break;
-    case SCREEN_CONFIRM:
-        draw_confirm_static();
-        g_confirm_last_remaining = -1;
-        break;
-    case SCREEN_MENU:
-        draw_list_screen("Menu", MENU_ITEMS, MENU_ROWS, MENU_ITEM_COUNT);
-        break;
-    case SCREEN_CREDENTIALS:
-        draw_info_screen("Credentials", "Enumeration is a", "planned feature");
-        break;
-    case SCREEN_OATH:
-        draw_info_screen("OATH codes", "TOTP display is a", "planned feature");
-        break;
-    case SCREEN_INFO:
-        draw_info_screen("Device info", "Pico FIDO Touch", "RP2040 1.69in");
-        break;
+static void build_ui(void) {
+    build_status_screen();
+    build_confirm_screen();
+    build_menu_screen();
+    build_info_screen(SCREEN_CREDENTIALS, "Credentials",
+                      "On-device enumeration", "is a planned feature");
+    build_info_screen(SCREEN_OATH, "OATH codes",
+                      "TOTP display", "is a planned feature");
+    build_info_screen(SCREEN_INFO, "Device info",
+                      "Pico FIDO Touch", "RP2040 1.69\" LCD");
+}
+
+/* ----- Dynamic updates -------------------------------------------------- */
+static void update_status(void) {
+    if (lbl_state) {
+        lv_label_set_text(lbl_state, g_mounted ? "Connected" : "Ready");
+        lv_obj_set_style_text_color(lbl_state,
+                                    g_mounted ? col_green() : col_yellow(), 0);
     }
-}
-
-static void goto_screen(ui_screen_t s) {
-    g_screen = s;
-    g_dirty = true;
-}
-
-/* ----- Input handling --------------------------------------------------- */
-static void handle_tap(int x, int y) {
-    switch (g_screen) {
-    case SCREEN_STATUS:
-        goto_screen(SCREEN_MENU);
-        break;
-    case SCREEN_CONFIRM:
-        if (rect_hit(&BTN_APPROVE, x, y)) {
-            touch_accept_button = true;
-        } else if (rect_hit(&BTN_DENY, x, y)) {
-            cancel_button = true;
+    if (lbl_batt) {
+        int pct = battery_read_percent();
+        if (pct >= 0) {
+            lv_label_set_text_fmt(lbl_batt, "Battery %d%%", pct);
+        } else {
+            lv_label_set_text(lbl_batt, "Battery --");
         }
-        break;
-    case SCREEN_MENU:
-        if (rect_hit(&MENU_ROWS[0], x, y)) {
-            goto_screen(SCREEN_CREDENTIALS);
-        } else if (rect_hit(&MENU_ROWS[1], x, y)) {
-            goto_screen(SCREEN_OATH);
-        } else if (rect_hit(&MENU_ROWS[2], x, y)) {
-            goto_screen(SCREEN_INFO);
-        } else if (rect_hit(&MENU_ROWS[3], x, y)) {
-            goto_screen(SCREEN_STATUS);
-        }
-        break;
-    case SCREEN_CREDENTIALS:
-    case SCREEN_OATH:
-    case SCREEN_INFO:
-        goto_screen(SCREEN_MENU);
-        break;
     }
 }
 
-static void poll_touch(void) {
-    cst816_touch_t t;
-    bool pressed = cst816_read(&t);
-    if (pressed && !g_prev_pressed) {
-        handle_tap(t.x, t.y);
+static void apply_context(void) {
+    if (lbl_rp) {
+        lv_label_set_text(lbl_rp, g_ctx_rp[0] ? g_ctx_rp : "User presence");
     }
-    g_prev_pressed = pressed;
+    if (lbl_user) {
+        lv_label_set_text(lbl_user, g_ctx_user);
+    }
 }
 
 /* ----- Signal handlers (run on core0 from button_wait / usb_task) ------- */
@@ -232,7 +322,9 @@ static int on_presence_request(signal_code_t code, void *data) {
         (signal_user_presence_request_data_t *)data;
     g_confirm_timeout_s = d ? d->timeout : 30;
     g_confirm_start_ms = board_millis();
-    goto_screen(SCREEN_CONFIRM);
+    g_confirm_last_remaining = -1;
+    apply_context();
+    show_screen(SCREEN_CONFIRM);
     return 0;
 }
 
@@ -240,7 +332,7 @@ static int on_presence_end(signal_code_t code, void *data) {
     (void)code;
     (void)data;
     g_ctx_rp[0] = g_ctx_user[0] = '\0';
-    goto_screen(SCREEN_STATUS);
+    show_screen(SCREEN_STATUS);
     return 0;
 }
 
@@ -248,9 +340,7 @@ static int on_usb_mounted(signal_code_t code, void *data) {
     (void)code;
     (void)data;
     g_mounted = true;
-    if (g_screen == SCREEN_STATUS) {
-        g_dirty = true;
-    }
+    update_status();
     return 0;
 }
 
@@ -264,12 +354,29 @@ void display_ui_set_context(const char *rp_id, const char *user_name) {
         strncpy(g_ctx_user, user_name, sizeof(g_ctx_user) - 1);
         g_ctx_user[sizeof(g_ctx_user) - 1] = '\0';
     }
+    apply_context();
 }
 
 void platform_ui_init(void) {
     st7789_init();
     cst816_init();
     battery_init();
+
+    lv_init();
+    lv_tick_set_cb(tick_cb);
+
+    g_disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
+    lv_display_set_flush_cb(g_disp, disp_flush);
+    lv_display_set_buffers(g_disp, g_draw_buf, NULL, sizeof(g_draw_buf),
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    g_indev = lv_indev_create();
+    lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(g_indev, touch_read);
+
+    build_ui();
+    update_status();
+    show_screen(SCREEN_STATUS);
 
     signal_add(SIGNAL_USB_MOUNTED, SIGNAL_FLAG_NONE, on_usb_mounted);
     signal_add(SIGNAL_USER_PRESENCE_REQUEST, SIGNAL_FLAG_NONE,
@@ -280,35 +387,28 @@ void platform_ui_init(void) {
                on_presence_end);
     signal_add(SIGNAL_USER_PRESENCE_TIMEOUT, SIGNAL_FLAG_NONE,
                on_presence_end);
-
-    g_screen = SCREEN_STATUS;
-    g_dirty = true;
 }
 
 void platform_ui_task(void) {
+    lv_timer_handler();
+
     uint32_t now = board_millis();
-
-    if (now >= g_next_poll_ms) {
-        poll_touch();
-        g_next_poll_ms = now + 20;
-    }
-
-    if (g_dirty) {
-        render_current_screen();
-        g_dirty = false;
-        g_next_status_ms = now + 1000;
-    }
 
     if (g_screen == SCREEN_CONFIRM) {
         uint32_t elapsed = (now - g_confirm_start_ms) / 1000;
         int remaining = (int)g_confirm_timeout_s - (int)elapsed;
+        if (remaining < 0) {
+            remaining = 0;
+        }
         if (remaining != g_confirm_last_remaining) {
-            draw_confirm_countdown(remaining);
             g_confirm_last_remaining = remaining;
+            if (lbl_count) {
+                lv_label_set_text_fmt(lbl_count, "%ds", remaining);
+            }
         }
     } else if (g_screen == SCREEN_STATUS && now >= g_next_status_ms) {
-        /* Refresh the battery reading periodically. */
-        g_dirty = true;
+        update_status();
+        g_next_status_ms = now + 1000;
     }
 }
 
