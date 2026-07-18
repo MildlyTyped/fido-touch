@@ -1,12 +1,13 @@
 /*
  * This file is part of the Pico FIDO Touch distribution.
  *
- * Touchscreen UI layer for the Waveshare RP2040-Touch-LCD-1.69.
+ * Touchscreen UI layer for the ESP32-S3 + Waveshare 2" Capacitive Touch LCD
+ * (ST7789T3 over SPI + CST816 over I2C).
  *
  * Provides platform_ui_init()/platform_ui_task() (the hooks the pico-keys
  * SDK calls when ENABLE_DISPLAY_UI is defined) and drives three screens:
  *   A) an Approve/Deny prompt for FIDO user-presence confirmation,
- *   B) an idle status screen (state + battery), and
+ *   B) an idle status screen, and
  *   C) a management menu (credentials / OATH / info).
  *
  * See docs/TOUCH_UI_PLAN.md for the full design.

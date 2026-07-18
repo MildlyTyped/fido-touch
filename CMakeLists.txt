@@ -31,6 +31,7 @@ if(ESP_PLATFORM)
         src/fido
         pico-keys-sdk/config/esp32/components/pico-keys-sdk
         pico-keys-sdk/config/esp32/components/tinycbor
+        pico-keys-sdk/config/esp32/components/cjson
     )
     if(ENABLE_PQC)
         list(APPEND EXTRA_COMPONENT_DIRS
@@ -39,25 +40,19 @@ if(ESP_PLATFORM)
             pico-keys-sdk/config/esp32/components/mlkem1024
         )
     endif()
+    # Touchscreen UI for the Waveshare 2" Capacitive Touch LCD (ST7789T3 + CST816).
+    option(ENABLE_DISPLAY_UI "Enable/disable the on-screen touch UI" OFF)
+    if(ENABLE_DISPLAY_UI)
+        list(APPEND EXTRA_COMPONENT_DIRS src/display)
+        add_compile_definitions(ENABLE_DISPLAY_UI=1)
+        add_compile_definitions(ENABLE_LVGL_UI=1)
+        set(SDKCONFIG_DEFAULTS
+            "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults"
+            "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.display")
+        message(STATUS "Touch display UI: \t\t enabled (LVGL / esp_lvgl_port)")
+    endif()
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 else()
-    # Install the bundled Waveshare board header into the Pico SDK's board dir
-    # before the SDK loads. This must run before pico_sdk_import.cmake so the
-    # SDK's board lookup - and the pico-keys import, which reads the header
-    # directly - both resolve the custom board name.
-    if(ENABLE_DISPLAY_UI AND NOT ENABLE_EMULATION
-       AND PICO_BOARD STREQUAL "waveshare_rp2040_touch_lcd_1_69")
-        if(NOT DEFINED PICO_SDK_PATH)
-            set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
-        endif()
-        if(PICO_SDK_PATH)
-            configure_file(
-                ${CMAKE_CURRENT_LIST_DIR}/src/boards/waveshare_rp2040_touch_lcd_1_69.h
-                ${PICO_SDK_PATH}/src/boards/include/boards/waveshare_rp2040_touch_lcd_1_69.h
-                COPYONLY)
-        endif()
-    endif()
-
     if(NOT ENABLE_EMULATION)
         set(PICO_USE_FASTEST_SUPPORTED_CLOCK 1)
         include(pico_sdk_import.cmake)
@@ -113,27 +108,6 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
-# Touchscreen UI for the Waveshare RP2040-Touch-LCD-1.69 (ST7789V2 + CST816T).
-option(ENABLE_DISPLAY_UI "Enable/disable the on-screen touch UI" OFF)
-if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
-    add_compile_definitions(ENABLE_DISPLAY_UI=1)
-    # Reuse the SDK's reserved LVGL task hook (pico-keys-sdk/src/main.c).
-    add_compile_definitions(ENABLE_LVGL_UI=1)
-    message(STATUS "Touch display UI: \t\t enabled (LVGL)")
-    # Vendored LVGL (lib/lvgl submodule). Point it at our lv_conf.h and skip
-    # the example/demo/thorvg targets we don't build.
-    set(LV_CONF_PATH ${CMAKE_CURRENT_LIST_DIR}/src/display/lv_conf.h)
-    set(LV_CONF_BUILD_DISABLE_EXAMPLES 1)
-    set(LV_CONF_BUILD_DISABLE_DEMOS 1)
-    set(LV_CONF_BUILD_DISABLE_THORVG_INTERNAL 1)
-    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/lib/lvgl)
-    # Drop LVGL's Helium/Neon .S accelerators (they include C headers that the
-    # assembler can't parse); the portable C blenders are used on RP2040.
-    get_target_property(_lvgl_srcs lvgl SOURCES)
-    list(FILTER _lvgl_srcs EXCLUDE REGEX "\\.S$")
-    set_target_properties(lvgl PROPERTIES SOURCES "${_lvgl_srcs}")
-endif()
-
 if(ENABLE_OTP_APP OR ENABLE_OATH_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
@@ -186,15 +160,6 @@ if(ENABLE_OTP_APP)
     )
 endif()
 
-if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
-    list(APPEND SOURCES
-        ${CMAKE_CURRENT_LIST_DIR}/src/display/st7789.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/display/cst816.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/display/battery.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/display/display_ui.c
-    )
-endif()
-
 SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
 if(ESP_PLATFORM)
     project(pico_fido)
@@ -203,12 +168,6 @@ endif()
 set(INCLUDES ${INCLUDES}
     ${CMAKE_CURRENT_LIST_DIR}/src/fido
 )
-
-if(ENABLE_DISPLAY_UI AND NOT ESP_PLATFORM AND NOT ENABLE_EMULATION)
-    set(INCLUDES ${INCLUDES}
-        ${CMAKE_CURRENT_LIST_DIR}/src/display
-    )
-endif()
 
 if(NOT ESP_PLATFORM)
     target_sources(pico_fido PUBLIC ${SOURCES})
@@ -329,9 +288,6 @@ if(NOT ESP_PLATFORM)
                 tinyusb_device
                 tinyusb_board
         )
-        if(ENABLE_DISPLAY_UI)
-            target_link_libraries(pico_fido PRIVATE lvgl)
-        endif()
         pico_add_extra_outputs(${CMAKE_PROJECT_NAME})
     endif()
 endif()

@@ -2,6 +2,3 @@
 	path = pico-keys-sdk
 	url = https://github.com/MildlyTyped/pico-keys-sdk
 	branch = touch-screen-support
-[submodule "lib/lvgl"]
-	path = lib/lvgl
-	url = https://github.com/lvgl/lvgl.git

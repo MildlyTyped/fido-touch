@@ -1,0 +1,10 @@
+# Extra defaults applied only when the touch UI is enabled (ENABLE_DISPLAY_UI).
+# LVGL fonts used by the UI screens.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+
+# 16-bit colour to match the ST7789 RGB565 panel.
+CONFIG_LV_COLOR_DEPTH_16=y

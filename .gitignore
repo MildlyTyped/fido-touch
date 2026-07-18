@@ -1,0 +1,10 @@
+# Build outputs
+/build/
+/build-*/
+release/
+
+# ESP-IDF generated files
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
