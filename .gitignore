@@ -8,3 +8,7 @@ sdkconfig
 sdkconfig.old
 dependencies.lock
 managed_components/
+
+# Secure Boot signing keys — MUST stay offline, never commit
+*.pem
+secure_boot_signing_key*

@@ -46,9 +46,13 @@ if(ESP_PLATFORM)
         list(APPEND EXTRA_COMPONENT_DIRS src/display)
         add_compile_definitions(ENABLE_DISPLAY_UI=1)
         add_compile_definitions(ENABLE_LVGL_UI=1)
-        set(SDKCONFIG_DEFAULTS
-            "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults"
-            "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.display")
+        # Add the LVGL/PSRAM display defaults, unless the caller supplied their
+        # own list (e.g. to append sdkconfig.defaults.secure) - don't clobber it.
+        if(NOT DEFINED SDKCONFIG_DEFAULTS)
+            set(SDKCONFIG_DEFAULTS
+                "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults"
+                "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.display")
+        endif()
         message(STATUS "Touch display UI: \t\t enabled (LVGL / esp_lvgl_port)")
     endif()
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)

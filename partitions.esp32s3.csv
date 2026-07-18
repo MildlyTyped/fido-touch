@@ -1,0 +1,10 @@
+# Partition table for the ESP32-S3-N16R8-EXT (16 MB flash).
+# Offsets start at 0x11000 so the same table works whether the partition table
+# lives at 0x8000 (default) or 0x10000 (Secure Boot needs the larger offset).
+# factory is 3 MB to leave headroom for the LVGL/touch UI (+ signature/padding
+# under Secure Boot + Flash Encryption); part0 is the pico-keys object store.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x11000,  0x6000
+phy_init, data, phy,      0x17000,  0x1000
+factory,  app,  factory,  0x20000,  0x300000
+part0,    0x40, 0x1,      0x320000, 0x100000
