@@ -247,6 +247,11 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
     user_name = user.parent.name.data;
     display_name = user.displayName.data;
 
+    /* Show the relying party / user on the touch Approve prompt, if built in. */
+    display_ui_set_context(rp.id.present ? rp.id.data : NULL,
+                           user.parent.name.present ? user.parent.name.data :
+                           (user.displayName.present ? user.displayName.data : NULL));
+
     uint8_t flags = FIDO2_AUT_FLAG_AT;
 #ifndef ENABLE_EMULATION
     bool button_pressed = false;

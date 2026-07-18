@@ -860,3 +860,50 @@ int credential_resident_verify(const file_t *ef, const uint8_t rp_id_hash[32], b
     }
     return ret;
 }
+
+#ifdef ENABLE_DISPLAY_UI
+static void ui_copy_cbor_text(char *dst, size_t dst_size, const CborCharString *s) {
+    if (dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!s || !s->present || s->data == NULL || s->len == 0) {
+        return;
+    }
+    size_t n = s->len < dst_size - 1 ? s->len : dst_size - 1;
+    memcpy(dst, s->data, n);
+    dst[n] = '\0';
+}
+
+int fido_ui_list_credentials(ui_list_entry_t *out, int max) {
+    if (!out || max <= 0) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < MAX_RESIDENT_CREDENTIALS && n < max; i++) {
+        file_t *ef = file_search((uint16_t)(EF_CRED + i));
+        if (!file_has_data(ef)) {
+            continue;
+        }
+        uint8_t rp_id_hash[32];
+        if (credential_resident_rp_id_hash(ef, rp_id_hash) != PICOKEYS_OK) {
+            continue;
+        }
+        Credential cred = { 0 };
+        if (credential_load_resident(ef, rp_id_hash, &cred) != 0) {
+            credential_free(&cred);
+            continue;
+        }
+        ui_copy_cbor_text(out[n].line1, sizeof(out[n].line1), &cred.rpId);
+        if (cred.userName.present) {
+            ui_copy_cbor_text(out[n].line2, sizeof(out[n].line2), &cred.userName);
+        }
+        else {
+            ui_copy_cbor_text(out[n].line2, sizeof(out[n].line2), &cred.userDisplayName);
+        }
+        credential_free(&cred);
+        n++;
+    }
+    return n;
+}
+#endif

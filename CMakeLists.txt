@@ -31,6 +31,7 @@ if(ESP_PLATFORM)
         src/fido
         pico-keys-sdk/config/esp32/components/pico-keys-sdk
         pico-keys-sdk/config/esp32/components/tinycbor
+        pico-keys-sdk/config/esp32/components/cjson
     )
     if(ENABLE_PQC)
         list(APPEND EXTRA_COMPONENT_DIRS
@@ -38,6 +39,21 @@ if(ESP_PLATFORM)
             pico-keys-sdk/config/esp32/components/mlkem768
             pico-keys-sdk/config/esp32/components/mlkem1024
         )
+    endif()
+    # Touchscreen UI for the Waveshare 2" Capacitive Touch LCD (ST7789T3 + CST816).
+    option(ENABLE_DISPLAY_UI "Enable/disable the on-screen touch UI" OFF)
+    if(ENABLE_DISPLAY_UI)
+        list(APPEND EXTRA_COMPONENT_DIRS src/display)
+        add_compile_definitions(ENABLE_DISPLAY_UI=1)
+        add_compile_definitions(ENABLE_LVGL_UI=1)
+        # Add the LVGL/PSRAM display defaults, unless the caller supplied their
+        # own list (e.g. to append sdkconfig.defaults.secure) - don't clobber it.
+        if(NOT DEFINED SDKCONFIG_DEFAULTS)
+            set(SDKCONFIG_DEFAULTS
+                "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults"
+                "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.display")
+        endif()
+        message(STATUS "Touch display UI: \t\t enabled (LVGL / esp_lvgl_port)")
     endif()
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 else()
@@ -269,6 +285,8 @@ if(NOT ESP_PLATFORM)
                 hardware_flash
                 hardware_sync
                 hardware_adc
+                hardware_spi
+                hardware_i2c
                 pico_unique_id
                 pico_aon_timer
                 tinyusb_device

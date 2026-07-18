@@ -1,0 +1,39 @@
+# =============================================================================
+#  HARDWARE SECURITY (Flash Encryption + Secure Boot v2) for ESP32-S3
+# =============================================================================
+#  !!!  IRREVERSIBLE  !!!
+#  Applying this fragment and flashing/booting on real hardware BURNS eFUSES.
+#  Once burned they CANNOT be reverted. A mistake can permanently brick the
+#  board or lock you out of it. Do NOT apply this during ordinary development.
+#  It is intentionally NOT part of the default build; opt in explicitly:
+#
+#     espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem
+#     idf.py -B build-secure \
+#       -DENABLE_DISPLAY_UI=1 \
+#       -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.display;sdkconfig.defaults.secure" \
+#       set-target esp32s3
+#     idf.py -B build-secure build
+#     idf.py -B build-secure flash monitor   # first boot burns eFuses
+#
+#  Keep secure_boot_signing_key.pem OFFLINE and OUT of git (see .gitignore).
+#  See docs/TOUCH_UI_PLAN.md -> "Hardware security provisioning".
+# =============================================================================
+
+# The signed Secure Boot bootloader is larger than the default 0x8000 table
+# offset; move the partition table to 0x10000 (the bundled partitions.csv puts
+# its first partition at 0x11000, so it still fits).
+CONFIG_PARTITION_TABLE_OFFSET=0x10000
+
+# --- Secure Boot v2 (only signed firmware runs) ---
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# --- Flash Encryption (Release mode: keys stay hardware-protected) ---
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+
+# --- Lock down the download/UART bootloader once provisioned ---
+CONFIG_SECURE_BOOT_ENABLE_AGGRESSIVE_KEY_REVOKE=y
+CONFIG_SECURE_DISABLE_ROM_DL_MODE=y

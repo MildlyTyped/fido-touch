@@ -535,6 +535,13 @@ int wait_button_pressed(void) {
 
 uint32_t user_present_time_limit = 0;
 
+/* Weak default: overridden by src/display/display_ui.c when the touch UI is
+ * built in (ENABLE_DISPLAY_UI). No-op otherwise. */
+__attribute__((weak)) void display_ui_set_context(const char *rp_id, const char *user_name) {
+    (void) rp_id;
+    (void) user_name;
+}
+
 bool check_user_presence(void) {
     if (user_present_time_limit == 0 || user_present_time_limit + TRANSPORT_TIME_LIMIT < board_millis()) {
         bool previous_force_button_wait = force_button_wait;
