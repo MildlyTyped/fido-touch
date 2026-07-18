@@ -6,7 +6,8 @@
  * Screens:
  *   A) SCREEN_CONFIRM  - Approve/Deny prompt for FIDO user presence.
  *   B) SCREEN_STATUS   - idle status + battery (default screen).
- *   C) SCREEN_MENU + sub-screens - management UI skeleton.
+ *   C) SCREEN_MENU + sub-screens - management UI: resident-credential and
+ *      OATH-account lists (read-only) plus device info.
  *
  * LVGL runs single-threaded on core 0: platform_ui_task() (called from the
  * SDK's execute_tasks()) drives lv_timer_handler(), and the presence/USB
@@ -29,10 +30,14 @@
 #include "signal.h"
 #include "button.h"
 #include "pico_time.h"
+#include "fido.h"
 
 /* Flags wired to the SDK user-presence loop (pico-keys-sdk/src/button.c). */
 extern bool touch_accept_button;
 extern volatile bool cancel_button;
+/* True while a USB transaction is in flight; gates the read-only store access
+ * done for the management screens so it never races an active FIDO command. */
+extern bool is_busy(void);
 
 /* ----- UI state --------------------------------------------------------- */
 typedef enum {
@@ -62,6 +67,9 @@ static lv_display_t *g_disp = NULL;
 static lv_indev_t *g_indev = NULL;
 
 static lv_obj_t *g_screens[SCREEN_COUNT] = {0};
+static lv_obj_t *g_creds_list = NULL; /* management: resident credentials */
+static lv_obj_t *g_oath_list = NULL;  /* management: OATH accounts         */
+#define UI_MAX_LIST 24
 static lv_obj_t *lbl_state = NULL;   /* status: Ready / Connected */
 static lv_obj_t *lbl_batt = NULL;    /* status: battery %          */
 static lv_obj_t *lbl_rp = NULL;      /* confirm: relying party     */
@@ -111,9 +119,14 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
 }
 
 /* ----- Navigation ------------------------------------------------------- */
+static void refresh_list(ui_screen_t which);
+
 static void show_screen(ui_screen_t s) {
     if (s >= SCREEN_COUNT || g_screens[s] == NULL) {
         return;
+    }
+    if (s == SCREEN_CREDENTIALS || s == SCREEN_OATH) {
+        refresh_list(s);
     }
     g_screen = s;
     lv_screen_load(g_screens[s]);
@@ -277,16 +290,81 @@ static void build_info_screen(ui_screen_t which, const char *title,
                         (void *)(intptr_t)SCREEN_MENU);
 }
 
+static lv_obj_t *build_list_screen(ui_screen_t which, const char *title,
+                                   const char *caption) {
+    lv_obj_t *s = make_screen();
+    g_screens[which] = s;
+
+    lv_obj_t *t = make_label(s, title, &lv_font_montserrat_20, col_white());
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+    int list_top = 34;
+    if (caption) {
+        lv_obj_t *c = make_label(s, caption, &lv_font_montserrat_14,
+                                 col_grey());
+        lv_obj_set_width(c, LCD_WIDTH - 12);
+        lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(c, LV_ALIGN_TOP_MID, 0, 30);
+        list_top = 50;
+    }
+
+    lv_obj_t *list = lv_list_create(s);
+    lv_obj_set_size(list, LCD_WIDTH, LCD_HEIGHT - list_top - 50);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, list_top);
+
+    lv_obj_t *back = lv_button_create(s);
+    lv_obj_set_size(back, LCD_WIDTH - 30, 40);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_t *lb = make_label(back, "Back", &lv_font_montserrat_20,
+                              col_white());
+    lv_obj_center(lb);
+    lv_obj_add_event_cb(back, nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCREEN_MENU);
+    return list;
+}
+
 static void build_ui(void) {
     build_status_screen();
     build_confirm_screen();
     build_menu_screen();
-    build_info_screen(SCREEN_CREDENTIALS, "Credentials",
-                      "On-device enumeration", "is a planned feature");
-    build_info_screen(SCREEN_OATH, "OATH codes",
-                      "TOTP display", "is a planned feature");
+    g_creds_list = build_list_screen(SCREEN_CREDENTIALS, "Credentials", NULL);
+    g_oath_list = build_list_screen(SCREEN_OATH, "OATH accounts",
+                                    "Codes need host time");
     build_info_screen(SCREEN_INFO, "Device info",
                       "Pico FIDO Touch", "RP2040 1.69\" LCD");
+}
+
+/* Populate a management list from the read-only FIDO/OATH accessors. Runs on
+ * core 0 and is skipped while a transaction is active (is_busy()). */
+static void refresh_list(ui_screen_t which) {
+    lv_obj_t *list = (which == SCREEN_CREDENTIALS) ? g_creds_list : g_oath_list;
+    if (list == NULL) {
+        return;
+    }
+    lv_obj_clean(list);
+    if (is_busy()) {
+        lv_list_add_text(list, "Device busy...");
+        return;
+    }
+    static ui_list_entry_t entries[UI_MAX_LIST];
+    int n = (which == SCREEN_CREDENTIALS)
+            ? fido_ui_list_credentials(entries, UI_MAX_LIST)
+            : fido_ui_list_oath(entries, UI_MAX_LIST);
+    if (n <= 0) {
+        lv_list_add_text(list, which == SCREEN_CREDENTIALS
+                         ? "No credentials" : "No accounts");
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        char buf[UI_LIST_TEXT_LEN * 2 + 4];
+        if (entries[i].line2[0]) {
+            snprintf(buf, sizeof(buf), "%s\n%s", entries[i].line1,
+                     entries[i].line2);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", entries[i].line1);
+        }
+        lv_list_add_button(list, NULL, buf);
+    }
 }
 
 /* ----- Dynamic updates -------------------------------------------------- */

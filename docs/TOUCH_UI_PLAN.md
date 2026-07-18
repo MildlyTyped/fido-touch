@@ -105,8 +105,16 @@ blenders are used instead). Screens are plain LVGL objects switched with
   full-width **APPROVE** (green) / **DENY** (red) buttons. Approve →
   `touch_accept_button`; Deny → `cancel_button`. Auto-returns to Status on
   complet/cancel/timeout.
-- **C — Menu.** Credentials / OATH codes / Device info / Back. The sub-screens
-  are placeholders today (see below).
+- **C — Menu.** Credentials / OATH accounts / Device info / Back.
+  - **Credentials** — scrollable list of resident FIDO credentials (relying
+    party + user name), populated on entry from `fido_ui_list_credentials()`.
+  - **OATH accounts** — scrollable list of stored OATH account names
+    (`fido_ui_list_oath()`). Codes are **not** generated on-device: TOTP needs
+    the current time, which only the host provides (this board has no RTC), and
+    the secrets may be OATH-password-locked.
+  - Both lists read the RAM-cached stores on core 0 and are skipped while a
+    transaction is active (`is_busy()`), so they never race a live command.
+    Device-info remains a static screen.
 
 ## Build & flash
 
@@ -138,13 +146,17 @@ links LVGL. Copy `pico_fido.uf2` to the board in BOOTSEL mode.
    screen A shows the RP id (+ user name for make-credential). The FIDO handlers
    run on core 1, so only the strings are copied there; the LVGL labels are
    updated from the core-0 presence-request handler.
-3. **Credentials & OATH screens (C)** — enumerate resident credentials and
-   render live TOTP codes. Needs read-only accessors into the FIDO/OATH stores.
+3. **Credentials & OATH screens (C)** — *done (read-only listing).*
+   `fido_ui_list_credentials()` (credential.c) enumerates resident credentials
+   and `fido_ui_list_oath()` (oath.c) lists OATH account names; the Menu
+   sub-screens render them as scrollable lists. On-device TOTP code generation
+   is intentionally out of scope — TOTP requires host-supplied time (no RTC)
+   and the OATH secrets can be password-locked.
 4. **PWM backlight** dimming (vendor demo uses PWM on GP25) and screen
    blanking / low-power sleep when idle to save battery.
 5. **IMU (QMI8658)** — optional orientation / tap-to-wake.
-6. **Richer LVGL UI** — the toolkit is in place; add themes, animations, a
-   scrollable credential list, and QR/large fonts as needed.
+6. **Richer LVGL UI** — the toolkit is in place; add themes, animations, and
+   QR/large fonts as needed.
 7. **Security note** — the RP2040 has no secure key storage (see the main
    README). A display does not change that; do not present it as a hardware
    security module.

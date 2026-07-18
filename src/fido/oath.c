@@ -1276,6 +1276,34 @@ static const cmd_t cmds[] = {
     { 0x00, 0x0 }
 };
 
+#ifdef ENABLE_DISPLAY_UI
+int fido_ui_list_oath(ui_list_entry_t *out, int max) {
+    if (!out || max <= 0 || !cap_supported(CAP_OATH)) {
+        return 0;
+    }
+    file_t *creds[MAX_OATH_CRED];
+    size_t num_creds = present_oath_cred_files(creds, MAX_OATH_CRED);
+    int n = 0;
+    for (size_t i = 0; i < num_creds && n < max; i++) {
+        file_t *ef = creds[i];
+        tlv_ctx_t ctxi, name = { 0 };
+        tlv_ctx_init(file_get_data(ef), file_get_size(ef), &ctxi);
+        if (!file_has_data(ef) || tlv_find_tag(&ctxi, TAG_NAME, &name) == false) {
+            continue;
+        }
+        /* TAG_NAME is stored in the clear ("issuer:account"); the key/secret is
+         * not, so no PIN is needed to list. Codes are not generated here: TOTP
+         * needs the current time, which only the host provides. */
+        size_t len = name.len < UI_LIST_TEXT_LEN - 1 ? name.len : UI_LIST_TEXT_LEN - 1;
+        memcpy(out[n].line1, name.data, len);
+        out[n].line1[len] = '\0';
+        out[n].line2[0] = '\0';
+        n++;
+    }
+    return n;
+}
+#endif
+
 static int oath_process_apdu(void) {
     if (CLA(apdu) != 0x00) {
         return SW_CLA_NOT_SUPPORTED();

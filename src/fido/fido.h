@@ -127,6 +127,21 @@ bool check_user_presence(void);
  * display UI (src/display/display_ui.c) is built in. Either argument may be
  * NULL. Copies the strings; the caller keeps ownership. */
 void display_ui_set_context(const char *rp_id, const char *user_name);
+
+#ifdef ENABLE_DISPLAY_UI
+/* Read-only accessors for the on-device management UI (feature C). They read
+ * the RAM-cached stores and must only be called from core 0 while the device
+ * is idle (see is_busy()). Each entry is NUL-terminated. Return the number of
+ * entries written (<= max). */
+#define UI_LIST_TEXT_LEN 48
+typedef struct ui_list_entry {
+    char line1[UI_LIST_TEXT_LEN];
+    char line2[UI_LIST_TEXT_LEN];
+} ui_list_entry_t;
+int fido_ui_list_credentials(ui_list_entry_t *out, int max);
+int fido_ui_list_oath(ui_list_entry_t *out, int max);
+#endif
+
 void fido_led_3_blinks(void);
 int fido_process_apdu(void);
 int cmd_register(void);
